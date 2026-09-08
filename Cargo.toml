@@ -1,0 +1,31 @@
+[package]
+name = "base_arb_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Base L2 Aerodrome/Uniswap V3 arbitrage engine - Day 1: market data + state foundation"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+alloy = { version = "2.4", features = [
+    "provider-http",
+    "provider-ws",
+    "pubsub",
+    "rpc-types-eth",
+    "network",
+    "sol-types",
+    "contract",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "1"
+anyhow = "1"
+dotenvy = "0.15"
+async-trait = "0.1"
+futures = "0.3"
+url = "2"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
