@@ -150,6 +150,7 @@ mod tests {
                 reserve0: U256::from(1_000u64),
                 reserve1: U256::from(2_000u64),
                 stable: false,
+                fee_bps: Some(U256::from(30u64)),
             },
         }
     }

@@ -12,7 +12,7 @@ const DEFAULT_UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6
 /// the contract's own source on BaseScan (labeled "Aerodrome: Pool Factory",
 /// address 0x420DD381b31aEf6683db6B902084cB0FFECe40Da, actively creating
 /// pools as of this writing). Overridable via `AERODROME_FACTORY_ADDRESS`.
-const DEFAULT_AERODROME_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
+pub(crate) const DEFAULT_AERODROME_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
 
 /// Aerodrome Slipstream (concentrated-liquidity) `CLFactory` deployments on
 /// Base. Verified against the official deployment table in the

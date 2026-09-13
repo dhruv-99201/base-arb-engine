@@ -262,6 +262,7 @@ impl DiscoveryPipeline {
                     reserve0: U256::ZERO,
                     reserve1: U256::ZERO,
                     stable: false,
+                    fee_bps: None, // not yet hydrated - see PoolKind::Aerodrome::fee_bps docs
                 });
 
             let skeleton = Pool {
@@ -410,6 +411,7 @@ fn placeholder_pool_kind(params: &DiscoveryParams) -> PoolKind {
             reserve0: U256::ZERO,
             reserve1: U256::ZERO,
             stable: *stable,
+            fee_bps: None, // not yet hydrated - see PoolKind::Aerodrome::fee_bps docs
         },
         DiscoveryParams::ConcentratedLiquidity { tick_spacing, .. } => {
             PoolKind::ConcentratedLiquidity {

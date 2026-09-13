@@ -1,4 +1,4 @@
-﻿//! Normalized, protocol-agnostic market state models.
+//! Normalized, protocol-agnostic market state models.
 //!
 //! Everything here uses integer/token-native units. No `f64`/`f32` anywhere
 //! in this module - see the financial-code rules in the Day 1 spec.
@@ -68,18 +68,36 @@ pub enum PoolKind {
     /// Aerodrome (Solidly-style) pool. `stable` distinguishes the stable
     /// (curve-like) formula from the volatile (x*y=k) formula - these are
     /// different pools with different math, not a toggle on one model.
+    /// `fee_bps` (Day 3) is the real per-pool fee read from the Aerodrome
+    /// factory's `getFee(pool, stable)` - never a hardcoded/assumed
+    /// constant, since Aerodrome allows per-pool fee overrides. Used
+    /// directly by `pricing::aerodrome_volatile::quote_pool_exact_input`.
+    ///
+    /// `Option<U256>`, NOT a bare `U256`: `U256::ZERO` cannot distinguish
+    /// a real, protocol-permitted zero-fee pool from a pool whose fee
+    /// simply hasn't been hydrated from the factory yet - collapsing those
+    /// into the same value would let an unhydrated placeholder silently
+    /// get quoted as if it were a genuine zero-fee pool. `None` means "not
+    /// yet hydrated" (the state every discovered-but-unread pool starts
+    /// in); `Some(U256::ZERO)` means "hydrated, and the real fee is zero".
+    /// `quote_pool_exact_input` rejects `None` explicitly rather than
+    /// defaulting it to zero.
     Aerodrome {
         reserve0: U256,
         reserve1: U256,
         stable: bool,
+        #[serde(default)]
+        fee_bps: Option<U256>,
     },
     /// Concentrated-liquidity state shape, shared by Uniswap V3 and
     /// Aerodrome Slipstream (structurally identical mechanics - a different
     /// factory/deployment, not different math). `Pool.dex` is what
     /// distinguishes which protocol a given pool actually belongs to.
     /// `initialized_ticks` is a sparse map of tick index -> net liquidity,
-    /// populated lazily as ticks are observed; Day 1/2 do not need the full
-    /// tick bitmap hydrated.
+    /// populated lazily as ticks are observed via
+    /// `dex::uniswap_v3::UniswapV3Adapter::hydrate_initialized_ticks`
+    /// (Day 3) - still empty by default, since hydration is opt-in and not
+    /// wired into the default pool-hydration path.
     ConcentratedLiquidity {
         fee_tier: u32,
         tick_spacing: i32,
