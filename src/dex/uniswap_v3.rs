@@ -48,6 +48,7 @@ use crate::error::{EngineError, EngineResult};
 use crate::events::decoder;
 use crate::events::model::MarketEvent;
 use crate::market::models::{Pool, PoolKind, PoolState};
+use crate::pricing::v3_quote::HydratedTicks;
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Log as RpcLog;
@@ -86,22 +87,6 @@ sol! {
             bool initialized
         );
     }
-}
-
-/// Real, hydrated tick data for a bounded range of tick-bitmap words around
-/// a pool's current tick - the confirmed-scanned range
-/// `pricing::v3_quote::quote_exact_input` requires to safely reject
-/// incomplete state (see that module's docs on `hydrated_tick_lo`/`hi`).
-/// Every entry in `initialized_ticks` comes from a real `ticks()` call on a
-/// bit this adapter actually observed set in a real `tickBitmap()` read -
-/// never fabricated or interpolated.
-#[derive(Debug, Clone)]
-pub struct HydratedTicks {
-    pub initialized_ticks: BTreeMap<i32, i128>,
-    /// Inclusive lower bound of the tick range actually confirmed hydrated.
-    pub hydrated_tick_lo: i32,
-    /// Inclusive upper bound of the tick range actually confirmed hydrated.
-    pub hydrated_tick_hi: i32,
 }
 
 /// Which bit positions (0..256) are set in a `tickBitmap()` word, in
@@ -214,11 +199,7 @@ impl UniswapV3Adapter {
         let hydrated_tick_lo = (word_pos_center - word_radius) * 256 * tick_spacing;
         let hydrated_tick_hi = ((word_pos_center + word_radius) * 256 + 255) * tick_spacing;
 
-        Ok(HydratedTicks {
-            initialized_ticks,
-            hydrated_tick_lo,
-            hydrated_tick_hi,
-        })
+        Ok(HydratedTicks::new(initialized_ticks, hydrated_tick_lo, hydrated_tick_hi))
     }
 
     /// The pinned-state interface: conceptually, read `slot0`, `liquidity`,
