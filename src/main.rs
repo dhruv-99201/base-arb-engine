@@ -61,6 +61,29 @@ async fn main() -> EngineResult<()> {
             }
         };
     }
+    if raw_args.len() > 1 && raw_args[1] == "inspect-v3" {
+        return match cli::parse_inspect_v3_args(&raw_args[2..]) {
+            Ok(cli::InspectV3Command::Help) => {
+                println!("{}", cli::INSPECT_V3_USAGE);
+                Ok(())
+            }
+            Ok(cli::InspectV3Command::Run {
+                pool,
+                block,
+                amount_in,
+                zero_for_one,
+            }) => {
+                let config = Config::load()?;
+                telemetry::init_tracing(&config.log_level);
+                cli::run_inspect_v3(&config, pool, block, amount_in, zero_for_one).await
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", cli::INSPECT_V3_USAGE);
+                std::process::exit(2)
+            }
+        };
+    }
 
     let config = Config::load()?;
     telemetry::init_tracing(&config.log_level);

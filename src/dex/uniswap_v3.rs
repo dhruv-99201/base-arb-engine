@@ -79,6 +79,13 @@ sol! {
         function liquidity() external view returns (uint128);
         function fee() external view returns (uint24);
         function tickSpacing() external view returns (int24);
+        /// Immutable pool token addresses. Added for `inspect-v3` (see
+        /// `UniswapV3Adapter::get_pool_state_and_ticks_at_block`, which
+        /// reads these pinned to the same block as every other read there) -
+        /// not called from `get_pool_state_impl`'s unpinned path, which is
+        /// unchanged.
+        function token0() external view returns (address);
+        function token1() external view returns (address);
         /// Real `tickBitmap(int16)` - one packed 256-bit word of
         /// initialized-tick flags per `wordPosition`. Day 3 addition.
         function tickBitmap(int16 wordPosition) external view returns (uint256);
@@ -305,6 +312,13 @@ impl UniswapV3Adapter {
     /// and `n` itself is used directly as the resulting `PoolState`'s
     /// `last_updated_block`, without an extra `get_block_number()` call
     /// (which would just be a fifth, unrelated "what's current now" read).
+    ///
+    /// `token0()`/`token1()` (added for `inspect-v3`) are read ONLY when
+    /// `at_block` is `Some(_)` - reusing this SAME `contract`/`provider`/
+    /// `block_id`, never a new connection - so the unpinned trait-level
+    /// `get_pool_state` (`at_block: None`, the default poll path) makes
+    /// exactly the same 4 calls it always has; this addition changes
+    /// nothing about its behavior or call count.
     async fn get_pool_state_impl(
         &self,
         rpc_url: &str,
@@ -358,6 +372,39 @@ impl UniswapV3Adapter {
             reason: format!("tickSpacing() failed: {e}"),
         })?;
 
+        // Added for `inspect-v3` (B's audit item 3). Deliberately gated on
+        // `block_id.is_some()` (i.e. `at_block: Some(_)`, the pinned path)
+        // ONLY - the unpinned `get_pool_state` trait method never runs
+        // this block, so its behavior/call count is completely unchanged.
+        // Reuses the exact SAME `contract` (and therefore the same
+        // `provider`/connection) already built above - no new Provider or
+        // contract binding - and the exact same `block_id` every other
+        // pinned call in this function uses, so this can never be a mixed
+        // pinned/latest read.
+        let tokens = if let Some(b) = block_id {
+            let token0 = contract
+                .token0()
+                .block(b)
+                .call()
+                .await
+                .map_err(|e| EngineError::Dex {
+                    dex: self.name().into(),
+                    reason: format!("token0() failed: {e}"),
+                })?;
+            let token1 = contract
+                .token1()
+                .block(b)
+                .call()
+                .await
+                .map_err(|e| EngineError::Dex {
+                    dex: self.name().into(),
+                    reason: format!("token1() failed: {e}"),
+                })?;
+            Some((token0, token1))
+        } else {
+            None
+        };
+
         // Freshness: when a block was explicitly requested, that IS the
         // block every read above was pinned to - use it directly rather
         // than making a fifth, independent "what's the current tip" call,
@@ -390,6 +437,14 @@ impl UniswapV3Adapter {
             liquidity,
             initialized_ticks: Default::default(),
         };
+        // Only `.address` is overwritten - `symbol`/`decimals` are left
+        // exactly as the caller's input `pool` had them (this function
+        // never calls `symbol()`/`decimals()`; see `cli::run_inspect_v3`
+        // for why that's out of scope).
+        if let Some((token0, token1)) = tokens {
+            updated_pool.token0.address = token0;
+            updated_pool.token1.address = token1;
+        }
 
         Ok(PoolState::new(updated_pool, block_number, None))
     }
@@ -592,6 +647,71 @@ mod tests {
         // No RPC server is actually listening in this environment, so this
         // must fail via a real attempted call (a transport/Dex error), not
         // succeed - there is no live RPC access here to succeed against.
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(EngineError::Dex { .. })),
+            "expected a real attempted-call failure mapped to EngineError::Dex, got {result:?}"
+        );
+    }
+
+    /// B's audit item 4: `token0()`/`token1()` (added to the SAME pinned
+    /// call chain as `slot0`/`liquidity`/`fee`/`tickSpacing`, reusing the
+    /// same `contract`/`provider`/`block_id` - see
+    /// `get_pool_state_impl`) must fail as a clean `EngineError::Dex`,
+    /// never a panic or an `unwrap()`, exactly like every other call in
+    /// that function already does.
+    ///
+    /// There is no live (or mock) RPC endpoint in this environment that
+    /// can make `slot0`/`liquidity`/`fee`/`tickSpacing` succeed while
+    /// making ONLY `token0`/`token1` fail, so this cannot isolate
+    /// `token0`/`token1`'s failure from the others earlier in the same
+    /// sequential chain - nothing in this sandbox can (see the module's
+    /// own "Unverified in this environment" note). What this DOES confirm
+    /// directly: the pinned state-read chain that `token0`/`token1` are
+    /// now a part of never panics against a real connection failure, and
+    /// always surfaces as `EngineError::Dex` specifically - not some other
+    /// variant, and not an `unwrap` panic - which is the same contract
+    /// `token0()`/`token1()` are implemented with (see
+    /// `get_pool_state_impl` above: identical `.map_err(|e| \
+    /// EngineError::Dex { .. })` shape as slot0/liquidity/fee/tickSpacing).
+    #[tokio::test]
+    async fn pinned_state_read_failure_is_engine_error_dex_not_panic() {
+        let adapter = UniswapV3Adapter::new();
+        let pool = Pool {
+            address: address!("0000000000000000000000000000000000000004"),
+            dex: DexKind::UniswapV3,
+            token0: Token {
+                address: address!("4200000000000000000000000000000000000006"),
+                symbol: "WETH".into(),
+                decimals: 18,
+            },
+            token1: Token {
+                address: address!("0000000000000000000000000000000000000002"),
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+            kind: PoolKind::ConcentratedLiquidity {
+                fee_tier: 500,
+                tick_spacing: 10,
+                sqrt_price_x96: U256::from(1u128) << 96usize,
+                current_tick: 0,
+                liquidity: 0,
+                initialized_ticks: Default::default(),
+            },
+        };
+
+        // Calling the private impl directly (this test lives in the same
+        // module) targets exactly the state-read chain token0/token1 are
+        // now part of, without also depending on tick-bitmap hydration.
+        let result = adapter
+            .get_pool_state_impl("http://localhost:8545", &pool, Some(12_345_678))
+            .await;
+
+        assert!(
+            matches!(result, Err(EngineError::Dex { .. })),
+            "a real connection failure on the pinned state-read chain \
+             (which token0()/token1() are now part of) must surface as \
+             EngineError::Dex, never panic and never some other error \
+             variant - got {result:?}"
+        );
     }
 }

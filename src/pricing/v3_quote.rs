@@ -142,6 +142,28 @@ impl HydratedTicks {
     ) -> Self {
         Self::new(initialized_ticks, hydrated_tick_lo, hydrated_tick_hi)
     }
+
+    /// Inclusive lower bound of the tick range actually confirmed
+    /// hydrated. Read-only - does not expose `initialized_ticks` itself,
+    /// preserving the "fields stay private" invariant this type exists to
+    /// enforce (see the struct docs' "Coupling safety" reference).
+    pub fn hydrated_tick_lo(&self) -> i32 {
+        self.hydrated_tick_lo
+    }
+
+    /// Inclusive upper bound of the tick range actually confirmed
+    /// hydrated. See [`Self::hydrated_tick_lo`].
+    pub fn hydrated_tick_hi(&self) -> i32 {
+        self.hydrated_tick_hi
+    }
+
+    /// Number of real initialized ticks currently held (each backed by an
+    /// actual `ticks()` call on a bit observed set in a real
+    /// `tickBitmap()` read - see the struct docs). Read-only - does not
+    /// expose the map itself.
+    pub fn initialized_tick_count(&self) -> usize {
+        self.initialized_ticks.len()
+    }
 }
 
 /// Real, hydrated Uniswap-V3-shaped pool state needed for a full
@@ -182,6 +204,11 @@ impl<'a> HydratedV3State<'a> {
         fee_pips: u32,
         hydrated: &'a HydratedTicks,
     ) -> EngineResult<Self> {
+        if tick_spacing <= 0 {
+            return Err(EngineError::Config(format!(
+                "HydratedV3State::new: tick_spacing must be positive, got {tick_spacing}"
+            )));
+        }
         if hydrated.hydrated_tick_lo > hydrated.hydrated_tick_hi {
             return Err(EngineError::Arithmetic(
                 "HydratedV3State::new: hydrated_tick_lo must be <= hydrated_tick_hi".into(),
@@ -477,6 +504,35 @@ mod tests {
         hydrated: &'a HydratedTicks,
     ) -> EngineResult<HydratedV3State<'a>> {
         HydratedV3State::new(sqrt_price_x96, current_tick, liquidity, tick_spacing, fee_pips, hydrated)
+    }
+
+    // --- HydratedTicks read-only accessor regression tests ---
+
+    /// `hydrated_tick_lo()`/`hydrated_tick_hi()`/`initialized_tick_count()`
+    /// must report exactly what `for_test` (i.e. `new`) was constructed
+    /// with - both the hydrated bounds and the real count of initialized
+    /// ticks held, without exposing `initialized_ticks` itself.
+    #[test]
+    fn accessors_report_bounds_and_count_for_populated_ticks() {
+        let mut ticks: BTreeMap<i32, i128> = BTreeMap::new();
+        ticks.insert(-60, 1_000_000);
+        ticks.insert(120, -1_000_000);
+
+        let hydrated = HydratedTicks::for_test(ticks, -1_000_000, 1_000_000);
+
+        assert_eq!(hydrated.hydrated_tick_lo(), -1_000_000);
+        assert_eq!(hydrated.hydrated_tick_hi(), 1_000_000);
+        assert_eq!(hydrated.initialized_tick_count(), 2);
+    }
+
+    /// Same accessors against an empty `initialized_ticks` map - a real,
+    /// common case (a pinned block with no initialized ticks in the
+    /// hydrated word range) - `initialized_tick_count()` must report 0,
+    /// not panic or misreport.
+    #[test]
+    fn initialized_tick_count_is_zero_for_empty_ticks() {
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        assert_eq!(hydrated.initialized_tick_count(), 0);
     }
 
     /// Independently computed via a pure-Python reimplementation of this
@@ -801,6 +857,109 @@ mod tests {
         )
         .expect_err("hydrated_tick_lo > hydrated_tick_hi must be rejected at construction");
         assert!(matches!(err, EngineError::Arithmetic(_)));
+    }
+
+    /// B's audit item: a zero or negative `tick_spacing` must never reach
+    /// `tick_bitmap::compress` (which divides by it) - `HydratedV3State`
+    /// must reject it at construction with a clean `EngineError`, not let
+    /// it flow through to `quote_exact_input`'s tick-walking loop (a
+    /// division-by-zero panic for `tick_spacing == 0`, or silently wrong
+    /// tick math for a negative one).
+    #[test]
+    fn new_rejects_zero_tick_spacing() {
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        let err = HydratedV3State::new(
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            10u128.pow(24),
+            0,
+            3000,
+            &hydrated,
+        )
+        .expect_err("tick_spacing == 0 must be rejected at construction");
+        assert!(matches!(err, EngineError::Config(_)));
+    }
+
+    /// Mirror of `new_rejects_zero_tick_spacing` for a negative
+    /// `tick_spacing`, which is equally invalid but a distinct case from
+    /// zero (no division-by-zero, but still nonsensical tick math).
+    #[test]
+    fn new_rejects_negative_tick_spacing() {
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        let err = HydratedV3State::new(
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            10u128.pow(24),
+            -60,
+            3000,
+            &hydrated,
+        )
+        .expect_err("negative tick_spacing must be rejected at construction");
+        assert!(matches!(err, EngineError::Config(_)));
+    }
+
+    /// Positive counterpart to `new_rejects_zero_tick_spacing`/
+    /// `new_rejects_negative_tick_spacing`: the same validation must NOT
+    /// reject a normal, valid `tick_spacing` - 60 is the real Uniswap V3
+    /// tick spacing for the 0.30% fee tier, already used throughout this
+    /// file's other tests (e.g. `zero_progress_single_step_at_word_boundary_still_terminates`).
+    /// Construction must succeed.
+    #[test]
+    fn new_accepts_valid_positive_tick_spacing() {
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        let result = HydratedV3State::new(
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            10u128.pow(24),
+            60,
+            3000,
+            &hydrated,
+        );
+        assert!(
+            result.is_ok(),
+            "tick_spacing = 60 (a normal, valid value) must be accepted: {result:?}"
+        );
+    }
+
+    /// Same check, exercised through `from_pool_state` (the real
+    /// adapter -> quote seam) rather than calling `HydratedV3State::new`
+    /// directly, so the construction-time guard is confirmed reachable
+    /// from a real `PoolState` too, not just the lower-level constructor.
+    #[test]
+    fn from_pool_state_rejects_zero_tick_spacing() {
+        use crate::market::models::{DexKind, Pool, Token};
+        use alloy::primitives::address;
+
+        let pool_state = PoolState::new(
+            Pool {
+                address: address!("0000000000000000000000000000000000000001"),
+                dex: DexKind::UniswapV3,
+                token0: Token {
+                    address: address!("4200000000000000000000000000000000000006"),
+                    symbol: "WETH".into(),
+                    decimals: 18,
+                },
+                token1: Token {
+                    address: address!("0000000000000000000000000000000000000002"),
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+                kind: PoolKind::ConcentratedLiquidity {
+                    fee_tier: 3000,
+                    tick_spacing: 0,
+                    sqrt_price_x96: get_sqrt_ratio_at_tick(0).unwrap(),
+                    current_tick: 0,
+                    liquidity: 10u128.pow(24),
+                    initialized_ticks: Default::default(),
+                },
+            },
+            123,
+            None,
+        );
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        let err = HydratedV3State::from_pool_state(&pool_state, &hydrated)
+            .expect_err("tick_spacing == 0 via from_pool_state must be rejected at construction");
+        assert!(matches!(err, EngineError::Config(_)));
     }
 
     #[test]

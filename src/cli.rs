@@ -15,8 +15,11 @@ use crate::dex::discovery::{
     AerodromeClassicDiscovery, AerodromeSlipstreamDiscovery, DiscoveredPool, DiscoveryParams,
     PoolDiscoveryAdapter, UniswapV3Discovery,
 };
+use crate::dex::UniswapV3Adapter;
 use crate::error::{EngineError, EngineResult};
-use alloy::primitives::{Address, B256};
+use crate::market::models::{DexKind, Pool, PoolKind, Token};
+use crate::pricing::v3_quote::{quote_exact_input, HydratedTicks, HydratedV3State, V3QuoteResult};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 
 pub const DISCOVER_TEST_USAGE: &str = "\
@@ -71,6 +74,46 @@ Options:
 Example:
   cargo run -- inspect-tx --tx 0x4104093239f998c41dab2b15864a1baa92198e62be57aa251fb724a320a76de6
 ";
+
+pub const INSPECT_V3_USAGE: &str = "\
+Usage: cargo run -- inspect-v3 --pool <ADDRESS> --block <U64> --amount-in <DECIMAL> [--zero-for-one]
+
+Read-only validation command. Fetches Uniswap V3 pool state (slot0,
+liquidity, fee, tickSpacing, token0, token1) and a real hydrated
+tick-bitmap range, both pinned to the exact requested historical block via
+UniswapV3Adapter::get_pool_state_and_ticks_at_block, builds a
+HydratedV3State from that pinned snapshot, and runs a single exact-input
+quote through quote_exact_input (the real tick-crossing swap loop).
+Prints a deterministic report of every input and result field.
+
+Does not modify any blockchain state, requires no private key, and never
+signs or submits a transaction. No router/quoter dependency. Uses
+BASE_RPC_URL from your environment/.env exactly like the rest of this
+program - a historical read at --block requires an archive-capable RPC
+endpoint.
+
+Options:
+  --pool <ADDRESS>        Uniswap V3 pool address. Required.
+  --block <U64>           Historical block number every read is pinned to. Required.
+  --amount-in <DECIMAL>   Exact input amount, as a base-10 integer in the
+                          input token's native (wei-like) units. No
+                          floating point. Required.
+  --zero-for-one          If present, quote token0 -> token1 (price
+                          decreases). If absent, quote token1 -> token0
+                          (price increases).
+  --help, -h              Show this help and exit.
+
+Example:
+  cargo run -- inspect-v3 --pool 0x1234567890123456789012345678901234567890 --block 12345678 --amount-in 1000000000000000000 --zero-for-one
+";
+
+/// Tick-bitmap word radius `inspect-v3` hydrates around the pool's current
+/// tick. There is no project-wide default for this yet (no config field,
+/// no other production call site) - `1` is the smallest non-zero radius
+/// already exercised by `dex::uniswap_v3::UniswapV3Adapter`'s own test
+/// (`get_pool_state_and_ticks_at_block_no_longer_short_circuits_some_block`),
+/// reused here rather than inventing a new arbitrary value.
+const INSPECT_V3_WORD_RADIUS: i32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoverTestCommand {
@@ -336,9 +379,268 @@ pub async fn run_inspect_tx(config: &Config, tx_hash: B256) -> EngineResult<()> 
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InspectV3Command {
+    Help,
+    Run {
+        pool: Address,
+        block: u64,
+        amount_in: U256,
+        zero_for_one: bool,
+    },
+}
+
+/// Parse `inspect-v3` subcommand arguments. Pure function - no I/O, fully
+/// unit-testable, same manual style as `parse_discover_test_args`/
+/// `parse_inspect_tx_args`. `--zero-for-one` is a bare flag (present =
+/// true, absent = false), never takes a value.
+pub fn parse_inspect_v3_args(args: &[String]) -> Result<InspectV3Command, String> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(InspectV3Command::Help);
+    }
+
+    let mut pool: Option<Address> = None;
+    let mut block: Option<u64> = None;
+    let mut amount_in: Option<U256> = None;
+    let mut zero_for_one = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pool" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--pool requires a value".to_string())?;
+                pool = Some(
+                    raw.parse::<Address>()
+                        .map_err(|_| format!("invalid --pool value: '{raw}'"))?,
+                );
+                i += 2;
+            }
+            "--block" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--block requires a value".to_string())?;
+                block = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("invalid --block value: '{raw}'"))?,
+                );
+                i += 2;
+            }
+            "--amount-in" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--amount-in requires a value".to_string())?;
+                amount_in = Some(U256::from_str_radix(raw, 10).map_err(|_| {
+                    format!(
+                        "invalid --amount-in value: '{raw}' (expected a non-negative base-10 \
+                         integer, no floating point)"
+                    )
+                })?);
+                i += 2;
+            }
+            "--zero-for-one" => {
+                zero_for_one = true;
+                i += 1;
+            }
+            other => return Err(format!("unrecognized argument: '{other}'")),
+        }
+    }
+
+    let pool = pool.ok_or_else(|| "missing required --pool <ADDRESS>".to_string())?;
+    let block = block.ok_or_else(|| "missing required --block <U64>".to_string())?;
+    let amount_in =
+        amount_in.ok_or_else(|| "missing required --amount-in <DECIMAL>".to_string())?;
+
+    Ok(InspectV3Command::Run {
+        pool,
+        block,
+        amount_in,
+        zero_for_one,
+    })
+}
+
+/// Format one `inspect-v3` result. Pure/deterministic: the same inputs
+/// always produce the same output string, and every field the spec
+/// requires is present. Takes the already-extracted `ConcentratedLiquidity`
+/// scalar fields (and the fetched token0/token1 addresses) directly
+/// (rather than a whole `PoolState`) so this function itself never needs
+/// to match on `PoolKind` or fabricate a fallback for the Aerodrome case -
+/// `run_inspect_v3` does that matching once, as a real `EngineResult`
+/// error path, before ever calling this.
+#[allow(clippy::too_many_arguments)]
+pub fn format_inspect_v3_report(
+    pool: Address,
+    block: u64,
+    token0: Address,
+    token1: Address,
+    fee_tier: u32,
+    tick_spacing: i32,
+    sqrt_price_x96: U256,
+    current_tick: i32,
+    liquidity: u128,
+    hydrated: &HydratedTicks,
+    amount_in: U256,
+    zero_for_one: bool,
+    result: &V3QuoteResult,
+) -> String {
+    let direction = if zero_for_one {
+        "zero_for_one (token0 -> token1)"
+    } else {
+        "one_for_zero (token1 -> token0)"
+    };
+
+    format!(
+        "inspect-v3 report\n\
+         pool={pool}\n\
+         block={block}\n\
+         token0={token0}\n\
+         token1={token1}\n\
+         fee={fee_tier}\n\
+         tick_spacing={tick_spacing}\n\
+         sqrt_price_x96={sqrt_price_x96}\n\
+         current_tick={current_tick}\n\
+         liquidity={liquidity}\n\
+         hydrated_tick_lower_bound={}\n\
+         hydrated_tick_upper_bound={}\n\
+         initialized_tick_count={}\n\
+         amount_in={amount_in}\n\
+         direction={direction}\n\
+         amount_out={}\n\
+         fee_paid={}\n\
+         ending_sqrt_price_x96={}\n\
+         ending_tick={}\n\
+         ticks_crossed={}",
+        hydrated.hydrated_tick_lo(),
+        hydrated.hydrated_tick_hi(),
+        hydrated.initialized_tick_count(),
+        result.amount_out,
+        result.fee_paid,
+        result.ending_sqrt_price_x96,
+        result.ending_tick,
+        result.ticks_crossed,
+    )
+}
+
+/// Execute `inspect-v3`: fetch a block-pinned Uniswap V3 pool snapshot
+/// (state + token0/token1 + hydrated ticks), build a `HydratedV3State`
+/// from it, run a single exact-input quote through the real
+/// tick-crossing swap loop (`quote_exact_input`), and print a
+/// deterministic report. Read-only - no signer, no transaction
+/// submission, no router/quoter dependency, no cross-DEX logic, no
+/// arbitrage execution. Never silently falls back to "latest" if the
+/// requested block is unavailable - `at_block: Some(block)` is passed
+/// straight through, and any RPC/adapter failure surfaces as a real
+/// `EngineError` rather than being swallowed or reinterpreted as a quote
+/// failure.
+pub async fn run_inspect_v3(
+    config: &Config,
+    pool: Address,
+    block: u64,
+    amount_in: U256,
+    zero_for_one: bool,
+) -> EngineResult<()> {
+    let adapter = UniswapV3Adapter::new();
+
+    // Placeholder pool identity: `get_pool_state_and_ticks_at_block` (via
+    // `get_pool_state_impl`) only ever reads `.address` from this struct
+    // for the state/ticks reads - `.kind` is fully overwritten from the
+    // real on-chain reads, and `.token0.address`/`.token1.address` are
+    // now also overwritten from real `token0()`/`token1()` reads (see
+    // `UniswapV3Adapter::get_pool_state_and_ticks_at_block`). Only
+    // `symbol`/`decimals` stay as placeholders, since this command never
+    // calls `symbol()`/`decimals()` - the report only needs the addresses.
+    let placeholder_pool = Pool {
+        address: pool,
+        dex: DexKind::UniswapV3,
+        token0: Token {
+            address: Address::ZERO,
+            symbol: "UNKNOWN".into(),
+            decimals: 18,
+        },
+        token1: Token {
+            address: Address::ZERO,
+            symbol: "UNKNOWN".into(),
+            decimals: 18,
+        },
+        kind: PoolKind::ConcentratedLiquidity {
+            fee_tier: 0,
+            tick_spacing: 1,
+            sqrt_price_x96: U256::ZERO,
+            current_tick: 0,
+            liquidity: 0,
+            initialized_ticks: Default::default(),
+        },
+    };
+
+    println!("inspect-v3: pool={pool} block={block}");
+
+    let (pool_state, hydrated) = adapter
+        .get_pool_state_and_ticks_at_block(
+            &config.base_rpc_url,
+            &placeholder_pool,
+            INSPECT_V3_WORD_RADIUS,
+            Some(block),
+        )
+        .await?;
+
+    let token0 = pool_state.pool.token0.address;
+    let token1 = pool_state.pool.token1.address;
+
+    let (fee_tier, tick_spacing, sqrt_price_x96, current_tick, liquidity) =
+        match &pool_state.pool.kind {
+            PoolKind::ConcentratedLiquidity {
+                fee_tier,
+                tick_spacing,
+                sqrt_price_x96,
+                current_tick,
+                liquidity,
+                ..
+            } => (
+                *fee_tier,
+                *tick_spacing,
+                *sqrt_price_x96,
+                *current_tick,
+                *liquidity,
+            ),
+            PoolKind::Aerodrome { .. } => {
+                return Err(EngineError::Dex {
+                    dex: "uniswap_v3".into(),
+                    reason: "inspect-v3: pool_state.kind resolved to Aerodrome after \
+                              get_pool_state_and_ticks_at_block - wrong adapter for this pool"
+                        .into(),
+                });
+            }
+        };
+
+    let state = HydratedV3State::from_pool_state(&pool_state, &hydrated)?;
+    let result = quote_exact_input(&state, amount_in, zero_for_one)?;
+
+    println!(
+        "\n{}",
+        format_inspect_v3_report(
+            pool,
+            block,
+            token0,
+            token1,
+            fee_tier,
+            tick_spacing,
+            sqrt_price_x96,
+            current_tick,
+            liquidity,
+            &hydrated,
+            amount_in,
+            zero_for_one,
+            &result,
+        )
+    );
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -578,5 +880,283 @@ mod tests {
         );
         assert!(report.contains("tick_spacing=200"));
         assert!(report.contains("fee=unavailable-from-factory-event"));
+    }
+
+    // --- inspect-v3 argument parsing ---
+
+    const SAMPLE_POOL: &str = "0x1234567890123456789012345678901234567890";
+
+    #[test]
+    fn inspect_v3_parses_valid_complete_command() {
+        let result = parse_inspect_v3_args(&args(&[
+            "--pool",
+            SAMPLE_POOL,
+            "--block",
+            "12345678",
+            "--amount-in",
+            "1000000000000000000",
+            "--zero-for-one",
+        ]));
+        assert_eq!(
+            result,
+            Ok(InspectV3Command::Run {
+                pool: SAMPLE_POOL.parse().unwrap(),
+                block: 12_345_678,
+                amount_in: U256::from(1_000_000_000_000_000_000u128),
+                zero_for_one: true,
+            })
+        );
+    }
+
+    #[test]
+    fn inspect_v3_help_flag_works() {
+        assert_eq!(
+            parse_inspect_v3_args(&args(&["--help"])),
+            Ok(InspectV3Command::Help)
+        );
+        assert_eq!(
+            parse_inspect_v3_args(&args(&["-h"])),
+            Ok(InspectV3Command::Help)
+        );
+    }
+
+    #[test]
+    fn inspect_v3_help_short_circuits_with_bogus_args() {
+        assert_eq!(
+            parse_inspect_v3_args(&args(&["--totally-bogus", "value", "--help"])),
+            Ok(InspectV3Command::Help)
+        );
+    }
+
+    #[test]
+    fn inspect_v3_missing_pool_is_rejected() {
+        let err = parse_inspect_v3_args(&args(&["--block", "1", "--amount-in", "1"])).unwrap_err();
+        assert!(err.contains("--pool"));
+    }
+
+    #[test]
+    fn inspect_v3_malformed_pool_is_rejected() {
+        let err = parse_inspect_v3_args(&args(&[
+            "--pool",
+            "not-an-address",
+            "--block",
+            "1",
+            "--amount-in",
+            "1",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("invalid --pool value"));
+    }
+
+    #[test]
+    fn inspect_v3_missing_block_is_rejected() {
+        let err =
+            parse_inspect_v3_args(&args(&["--pool", SAMPLE_POOL, "--amount-in", "1"])).unwrap_err();
+        assert!(err.contains("--block"));
+    }
+
+    #[test]
+    fn inspect_v3_malformed_block_is_rejected() {
+        let err = parse_inspect_v3_args(&args(&[
+            "--pool",
+            SAMPLE_POOL,
+            "--block",
+            "not-a-number",
+            "--amount-in",
+            "1",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("invalid --block value"));
+    }
+
+    #[test]
+    fn inspect_v3_missing_amount_in_is_rejected() {
+        let err = parse_inspect_v3_args(&args(&["--pool", SAMPLE_POOL, "--block", "1"])).unwrap_err();
+        assert!(err.contains("--amount-in"));
+    }
+
+    #[test]
+    fn inspect_v3_malformed_amount_in_is_rejected() {
+        // Floating-point input must be rejected - U256::from_str_radix has
+        // no notion of a decimal point.
+        let err = parse_inspect_v3_args(&args(&[
+            "--pool",
+            SAMPLE_POOL,
+            "--block",
+            "1",
+            "--amount-in",
+            "1.5",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("invalid --amount-in value"));
+    }
+
+    #[test]
+    fn inspect_v3_dangling_flag_without_value_is_rejected() {
+        let err = parse_inspect_v3_args(&args(&["--pool"])).unwrap_err();
+        assert!(err.contains("--pool requires a value"));
+    }
+
+    #[test]
+    fn inspect_v3_unrecognized_argument_is_rejected() {
+        let err = parse_inspect_v3_args(&args(&["--wat", "1"])).unwrap_err();
+        assert!(err.contains("unrecognized argument"));
+    }
+
+    #[test]
+    fn inspect_v3_zero_for_one_present_is_true() {
+        let result = parse_inspect_v3_args(&args(&[
+            "--pool",
+            SAMPLE_POOL,
+            "--block",
+            "1",
+            "--amount-in",
+            "1",
+            "--zero-for-one",
+        ]));
+        match result {
+            Ok(InspectV3Command::Run { zero_for_one, .. }) => assert!(zero_for_one),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_v3_zero_for_one_absent_is_false() {
+        let result =
+            parse_inspect_v3_args(&args(&["--pool", SAMPLE_POOL, "--block", "1", "--amount-in", "1"]));
+        match result {
+            Ok(InspectV3Command::Run { zero_for_one, .. }) => assert!(!zero_for_one),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    // --- inspect-v3 report formatting ---
+
+    fn sample_inspect_v3_result() -> V3QuoteResult {
+        V3QuoteResult {
+            amount_in: U256::from(1_000_000_000_000_000_000u128),
+            amount_out: U256::from(2_500_000_000u128),
+            fee_paid: U256::from(3_000_000_000_000_000u128),
+            ending_sqrt_price_x96: U256::from(79_228_162_514_264_337_593_543_950_336u128),
+            ending_tick: 42,
+            liquidity_after: 10_000_000_000_000_000_000_000u128,
+            ticks_crossed: 1,
+        }
+    }
+
+    #[test]
+    fn inspect_v3_report_formatting_is_deterministic() {
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        let result = sample_inspect_v3_result();
+        let pool: Address = SAMPLE_POOL.parse().unwrap();
+        let token0: Address = "0x4200000000000000000000000000000000000006"
+            .parse()
+            .unwrap();
+        let token1: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+
+        let a = format_inspect_v3_report(
+            pool,
+            12_345_678,
+            token0,
+            token1,
+            3000,
+            60,
+            U256::from(79_228_162_514_264_337_593_543_950_336u128),
+            30,
+            10u128.pow(24),
+            &hydrated,
+            U256::from(1_000_000_000_000_000_000u128),
+            true,
+            &result,
+        );
+        let b = format_inspect_v3_report(
+            pool,
+            12_345_678,
+            token0,
+            token1,
+            3000,
+            60,
+            U256::from(79_228_162_514_264_337_593_543_950_336u128),
+            30,
+            10u128.pow(24),
+            &hydrated,
+            U256::from(1_000_000_000_000_000_000u128),
+            true,
+            &result,
+        );
+        assert_eq!(
+            a, b,
+            "formatting the same inputs twice must produce identical output"
+        );
+    }
+
+    #[test]
+    fn inspect_v3_report_contains_all_required_fields() {
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        let result = sample_inspect_v3_result();
+        let pool: Address = SAMPLE_POOL.parse().unwrap();
+        let token0: Address = "0x4200000000000000000000000000000000000006"
+            .parse()
+            .unwrap();
+        let token1: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+
+        let report = format_inspect_v3_report(
+            pool,
+            12_345_678,
+            token0,
+            token1,
+            3000,
+            60,
+            U256::from(79_228_162_514_264_337_593_543_950_336u128),
+            30,
+            10u128.pow(24),
+            &hydrated,
+            U256::from(1_000_000_000_000_000_000u128),
+            true,
+            &result,
+        );
+
+        assert!(report.contains(&format!("pool={pool}")));
+        assert!(report.contains("block=12345678"));
+        assert!(report.contains(&format!("token0={token0}")));
+        assert!(report.contains(&format!("token1={token1}")));
+        assert!(report.contains("fee=3000"));
+        assert!(report.contains("tick_spacing=60"));
+        assert!(report.contains("sqrt_price_x96=79228162514264337593543950336"));
+        assert!(report.contains("current_tick=30"));
+        assert!(report.contains(&format!("liquidity={}", 10u128.pow(24))));
+        assert!(report.contains("hydrated_tick_lower_bound=-100000"));
+        assert!(report.contains("hydrated_tick_upper_bound=100000"));
+        assert!(report.contains("initialized_tick_count=0"));
+        assert!(report.contains("amount_in=1000000000000000000"));
+        assert!(report.contains("direction=zero_for_one"));
+        assert!(report.contains("amount_out=2500000000"));
+        assert!(report.contains("fee_paid=3000000000000000"));
+        assert!(report.contains("ending_sqrt_price_x96=79228162514264337593543950336"));
+        assert!(report.contains("ending_tick=42"));
+        assert!(report.contains("ticks_crossed=1"));
+    }
+
+    #[test]
+    fn inspect_v3_report_direction_reflects_zero_for_one_false() {
+        let hydrated = HydratedTicks::for_test(BTreeMap::new(), -100_000, 100_000);
+        let result = sample_inspect_v3_result();
+        let pool: Address = SAMPLE_POOL.parse().unwrap();
+        let token0: Address = "0x4200000000000000000000000000000000000006"
+            .parse()
+            .unwrap();
+        let token1: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+
+        let report = format_inspect_v3_report(
+            pool, 1, token0, token1, 3000, 60, U256::from(1u64), 0, 0, &hydrated,
+            U256::from(1u64), false, &result,
+        );
+        assert!(report.contains("direction=one_for_zero"));
     }
 }
