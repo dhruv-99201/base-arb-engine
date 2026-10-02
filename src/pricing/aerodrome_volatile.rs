@@ -223,6 +223,30 @@ mod tests {
         assert_eq!(result, U256::from(7u64));
     }
 
+    /// Golden regression fixture: the real Aerodrome Classic volatile
+    /// WETH/USDC pool on Base (0xcDAC0d6c6C59727a65F871236188350531885C43),
+    /// state read at block 26000000 (reserve0/reserve1/fee_bps below are
+    /// real on-chain values, not synthetic). The deployed pool's own
+    /// `getAmountOut(1000000000000000000, token0/WETH)` at that exact
+    /// block returned exactly 2753396596 - this pins this function's
+    /// output to that real, externally-verified reference value rather
+    /// than only to this engine's own prior output or a hand-picked
+    /// round-number case. Network-free: every input is baked into the
+    /// fixture; nothing here makes an RPC call.
+    #[test]
+    fn real_fixture_aerodrome_weth_usdc_block_26000000() {
+        let amount_in = U256::from(1_000_000_000_000_000_000u128);
+        let reserve_in = U256::from_str_radix("3607642796485591444113", 10).unwrap();
+        let reserve_out = U256::from(9_965_914_277_780u64);
+        let fee_bps = U256::from(30u64);
+
+        let result =
+            quote_exact_input_aerodrome_volatile(amount_in, reserve_in, reserve_out, fee_bps)
+                .unwrap();
+
+        assert_eq!(result, U256::from(2_753_396_596u64));
+    }
+
     fn aerodrome_pool(fee_bps: Option<U256>, stable: bool) -> Pool {
         use crate::market::models::{DexKind, Token};
         use alloy::primitives::address;
