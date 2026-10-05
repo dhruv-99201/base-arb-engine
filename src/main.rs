@@ -1,4 +1,5 @@
-﻿mod chain;
+﻿mod arbitrage;
+mod chain;
 mod cli;
 mod config;
 mod dex;
