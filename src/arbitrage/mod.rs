@@ -9,5 +9,7 @@
 //! docs for the exact boundary.
 
 pub mod opportunity;
+pub mod quote;
 
 pub use opportunity::{LegQuote, Opportunity};
+pub use quote::{quote_aerodrome_leg, quote_uniswap_v3_leg};
