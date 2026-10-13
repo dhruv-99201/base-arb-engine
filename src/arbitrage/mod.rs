@@ -8,8 +8,10 @@
 //! threshold, and does not execute anything - see `opportunity` module
 //! docs for the exact boundary.
 
+pub mod historical;
 pub mod opportunity;
 pub mod quote;
 
+pub use historical::{HistoricalAerodromeInput, HistoricalUniswapV3Input};
 pub use opportunity::{LegQuote, Opportunity};
 pub use quote::{quote_aerodrome_leg, quote_uniswap_v3_leg};
