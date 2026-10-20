@@ -12,8 +12,10 @@ pub mod historical;
 pub mod multi_quote;
 pub mod opportunity;
 pub mod quote;
+pub mod routes;
 
 pub use historical::{HistoricalAerodromeInput, HistoricalUniswapV3Input};
 pub use multi_quote::{quote_historical_candidates_at_block, HistoricalQuoteInput, QuoteOutcome};
 pub use opportunity::{LegQuote, Opportunity};
 pub use quote::{quote_aerodrome_leg, quote_uniswap_v3_leg};
+pub use routes::{enumerate_cross_dex_routes_at_block, EnumeratedRoute, RouteLeg};
