@@ -86,6 +86,41 @@ async fn main() -> EngineResult<()> {
         };
     }
 
+    if raw_args.len() > 1 && raw_args[1] == "inspect-arb" {
+        return match cli::parse_inspect_arb_args(&raw_args[2..]) {
+            Ok(cli::InspectArbCommand::Help) => {
+                println!("{}", cli::INSPECT_ARB_USAGE);
+                Ok(())
+            }
+            Ok(cli::InspectArbCommand::Run {
+                aerodrome_pool,
+                uniswap_v3_pool,
+                block,
+                token_in,
+                amount_in,
+                word_radius,
+            }) => {
+                let config = Config::load()?;
+                telemetry::init_tracing(&config.log_level);
+                cli::run_inspect_arb(
+                    &config,
+                    aerodrome_pool,
+                    uniswap_v3_pool,
+                    block,
+                    token_in,
+                    amount_in,
+                    word_radius,
+                )
+                .await
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", cli::INSPECT_ARB_USAGE);
+                std::process::exit(2)
+            }
+        };
+    }
+
     let config = Config::load()?;
     telemetry::init_tracing(&config.log_level);
 

@@ -15,7 +15,11 @@ use crate::dex::discovery::{
     AerodromeClassicDiscovery, AerodromeSlipstreamDiscovery, DiscoveredPool, DiscoveryParams,
     PoolDiscoveryAdapter, UniswapV3Discovery,
 };
-use crate::dex::UniswapV3Adapter;
+use crate::arbitrage::{
+    detect_cross_dex_opportunities_at_block, HistoricalAerodromeInput, HistoricalQuoteInput,
+    HistoricalUniswapV3Input, RouteEvaluationFailure, RouteOutcome,
+};
+use crate::dex::{AerodromeAdapter, UniswapV3Adapter};
 use crate::error::{EngineError, EngineResult};
 use crate::market::models::{DexKind, Pool, PoolKind, Token};
 use crate::pricing::v3_quote::{quote_exact_input, HydratedTicks, HydratedV3State, V3QuoteResult};
@@ -637,6 +641,430 @@ pub async fn run_inspect_v3(
     Ok(())
 }
 
+pub const INSPECT_ARB_USAGE: &str = "\
+Usage: cargo run -- inspect-arb --aerodrome-pool <ADDRESS> --uniswap-v3-pool <ADDRESS> --block <U64> --token-in <ADDRESS> --amount-in <DECIMAL_INTEGER> [--word-radius <I32>]
+
+Read-only historical cross-DEX inspection. Reads one Aerodrome Classic
+pool and one Uniswap V3 pool (with hydrated ticks), both pinned to the
+exact same historical block number, builds the validated historical
+inputs, and runs the existing cross-DEX opportunity detector on them.
+Prints EVERY route outcome (successes, losses, zero-profit routes and
+quote failures); nothing is sorted or filtered by profit.
+
+The printed gross_profit_raw is a raw quote difference in the smallest
+unit of the starting token. It is NOT net profit: no gas cost and no
+execution or settlement cost is subtracted, it is a historical quote
+evaluation (not a live or executable signal), and no transaction is ever
+signed or submitted. No USD conversion is attempted.
+
+Uses BASE_RPC_URL from your environment/.env. A historical read at --block
+requires an archive-capable RPC endpoint when that block is outside the
+provider's retained state window; there is no fallback to latest state.
+Reads are pinned by block number, not by block hash.
+
+Options:
+  --aerodrome-pool <ADDRESS>   Aerodrome Classic (volatile) pool address. Required.
+  --uniswap-v3-pool <ADDRESS>  Uniswap V3 pool address. Required.
+  --block <U64>                Historical block every read is pinned to. Required.
+  --token-in <ADDRESS>         Starting token; must be one of the pools' tokens. Required.
+  --amount-in <DECIMAL_INTEGER>
+                               Positive base-10 integer in the starting
+                               token's smallest units. No floating point. Required.
+  --word-radius <I32>          Non-negative V3 tick-bitmap word radius
+                               (default: 1, same as inspect-v3).
+  --help, -h                   Show this help and exit.
+
+Example:
+  cargo run -- inspect-arb --aerodrome-pool 0xcDAC0d6c6C59727a65F871236188350531885C43 --uniswap-v3-pool 0xd0b53D9277642d899DF5C87A3966A349A798F224 --block 26000000 --token-in 0x4200000000000000000000000000000000000006 --amount-in 1000000000000000
+";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectArbCommand {
+    Help,
+    Run {
+        aerodrome_pool: Address,
+        uniswap_v3_pool: Address,
+        block: u64,
+        token_in: Address,
+        amount_in: U256,
+        word_radius: i32,
+    },
+}
+
+/// Parse `inspect-arb` arguments (everything after `inspect-arb`). Pure
+/// function - no I/O, same manual style as `parse_inspect_v3_args`.
+/// `--help`/`-h` wins over everything else. Every value is validated here,
+/// before any RPC call.
+pub fn parse_inspect_arb_args(args: &[String]) -> Result<InspectArbCommand, String> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(InspectArbCommand::Help);
+    }
+
+    fn value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a String, String> {
+        args.get(i + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))
+    }
+
+    let mut aerodrome_pool: Option<Address> = None;
+    let mut uniswap_v3_pool: Option<Address> = None;
+    let mut block: Option<u64> = None;
+    let mut token_in: Option<Address> = None;
+    let mut amount_in: Option<U256> = None;
+    let mut word_radius = INSPECT_V3_WORD_RADIUS;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--aerodrome-pool" => {
+                let raw = value(args, i, "--aerodrome-pool")?;
+                aerodrome_pool = Some(
+                    raw.parse::<Address>()
+                        .map_err(|_| format!("invalid --aerodrome-pool value: '{raw}'"))?,
+                );
+            }
+            "--uniswap-v3-pool" => {
+                let raw = value(args, i, "--uniswap-v3-pool")?;
+                uniswap_v3_pool = Some(
+                    raw.parse::<Address>()
+                        .map_err(|_| format!("invalid --uniswap-v3-pool value: '{raw}'"))?,
+                );
+            }
+            "--block" => {
+                let raw = value(args, i, "--block")?;
+                block = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("invalid --block value: '{raw}'"))?,
+                );
+            }
+            "--token-in" => {
+                let raw = value(args, i, "--token-in")?;
+                token_in = Some(
+                    raw.parse::<Address>()
+                        .map_err(|_| format!("invalid --token-in value: '{raw}'"))?,
+                );
+            }
+            "--amount-in" => {
+                let raw = value(args, i, "--amount-in")?;
+                // `U256::from_str_radix("", 10)` yields 0 rather than an
+                // error, so an empty value must be rejected explicitly.
+                let parsed = if raw.is_empty() {
+                    None
+                } else {
+                    U256::from_str_radix(raw, 10).ok()
+                }
+                .ok_or_else(|| {
+                    format!(
+                        "invalid --amount-in value: '{raw}' (expected a positive base-10 \
+                         integer, no floating point)"
+                    )
+                })?;
+                if parsed.is_zero() {
+                    return Err("--amount-in must be greater than zero".to_string());
+                }
+                amount_in = Some(parsed);
+            }
+            "--word-radius" => {
+                let raw = value(args, i, "--word-radius")?;
+                let parsed = raw.parse::<i32>().map_err(|_| {
+                    format!("invalid --word-radius value: '{raw}' (expected a non-negative integer)")
+                })?;
+                if parsed < 0 {
+                    return Err(format!("--word-radius must be non-negative, got {parsed}"));
+                }
+                word_radius = parsed;
+            }
+            other => return Err(format!("unrecognized argument: '{other}'")),
+        }
+        i += 2;
+    }
+
+    Ok(InspectArbCommand::Run {
+        aerodrome_pool: aerodrome_pool
+            .ok_or_else(|| "missing required --aerodrome-pool <ADDRESS>".to_string())?,
+        uniswap_v3_pool: uniswap_v3_pool
+            .ok_or_else(|| "missing required --uniswap-v3-pool <ADDRESS>".to_string())?,
+        block: block.ok_or_else(|| "missing required --block <U64>".to_string())?,
+        token_in: token_in.ok_or_else(|| "missing required --token-in <ADDRESS>".to_string())?,
+        amount_in: amount_in
+            .ok_or_else(|| "missing required --amount-in <DECIMAL_INTEGER>".to_string())?,
+        word_radius,
+    })
+}
+
+/// Abort unless the RPC-reported chain ID is the configured one.
+pub fn check_chain_id(observed: u64, configured: u64) -> EngineResult<()> {
+    if observed != configured {
+        return Err(EngineError::Chain(format!(
+            "inspect-arb: RPC reports chain id {observed} but BASE_CHAIN_ID is {configured}; \
+             refusing to inspect an unintended chain"
+        )));
+    }
+    Ok(())
+}
+
+/// Both pools' on-chain token pairs must be the same UNORDERED pair, and
+/// `token_in` must be one of them. Pure; never reorders or repairs.
+pub fn validate_pair_and_direction(
+    aerodrome_pool: Address,
+    aerodrome_tokens: (Address, Address),
+    uniswap_v3_pool: Address,
+    uniswap_v3_tokens: (Address, Address),
+    token_in: Address,
+) -> EngineResult<()> {
+    let (a0, a1) = aerodrome_tokens;
+    let (v0, v1) = uniswap_v3_tokens;
+    let same_pair = (a0 == v0 && a1 == v1) || (a0 == v1 && a1 == v0);
+    if !same_pair {
+        return Err(EngineError::State(format!(
+            "inspect-arb: pools do not share the same token pair: aerodrome pool \
+             {aerodrome_pool} has ({a0}, {a1}), uniswap_v3 pool {uniswap_v3_pool} has ({v0}, {v1})"
+        )));
+    }
+    if token_in != a0 && token_in != a1 {
+        return Err(EngineError::State(format!(
+            "inspect-arb: --token-in {token_in} is not one of the pools' tokens ({a0}, {a1})"
+        )));
+    }
+    Ok(())
+}
+
+/// Request/snapshot facts printed at the top of the `inspect-arb` report.
+#[derive(Debug, Clone, Copy)]
+pub struct InspectArbHeader {
+    pub chain_id: u64,
+    pub block: u64,
+    pub aerodrome_pool: Address,
+    pub aerodrome_tokens: (Address, Address),
+    pub uniswap_v3_pool: Address,
+    pub uniswap_v3_tokens: (Address, Address),
+    pub token_in: Address,
+    pub amount_in: U256,
+    pub word_radius: i32,
+}
+
+/// Deterministic `inspect-arb` report. Pure: same inputs, same string.
+/// Prints every outcome in the order given - no sorting, no filtering.
+pub fn format_inspect_arb_report(header: &InspectArbHeader, outcomes: &[RouteOutcome]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "inspect-arb report\n\
+         chain_id={}\n\
+         block={}\n\
+         aerodrome_pool={}\n\
+         aerodrome_token0={}\n\
+         aerodrome_token1={}\n\
+         uniswap_v3_pool={}\n\
+         uniswap_v3_token0={}\n\
+         uniswap_v3_token1={}\n\
+         token_in={}\n\
+         amount_in_raw={}\n\
+         v3_word_radius={}\n\
+         routes_evaluated={}\n",
+        header.chain_id,
+        header.block,
+        header.aerodrome_pool,
+        header.aerodrome_tokens.0,
+        header.aerodrome_tokens.1,
+        header.uniswap_v3_pool,
+        header.uniswap_v3_tokens.0,
+        header.uniswap_v3_tokens.1,
+        header.token_in,
+        header.amount_in,
+        header.word_radius,
+        outcomes.len(),
+    ));
+
+    if outcomes.is_empty() {
+        out.push_str("no route matched the requested token direction; nothing was evaluated\n");
+    }
+
+    for (idx, outcome) in outcomes.iter().enumerate() {
+        let route = outcome.route();
+        out.push_str(&format!(
+            "\n[route {}]\n\
+             start_token={}\n\
+             intermediate_token={}\n\
+             leg1={} pool={}\n\
+             leg2={} pool={}\n\
+             route_block={}\n",
+            idx + 1,
+            route.starting_token(),
+            route.intermediate_token(),
+            route.leg1().dex(),
+            route.leg1().pool_address(),
+            route.leg2().dex(),
+            route.leg2().pool_address(),
+            route.block(),
+        ));
+        match outcome.result() {
+            Ok(opp) => out.push_str(&format!(
+                "status=OK\n\
+                 input_amount_raw={}\n\
+                 intermediate_amount_raw={}\n\
+                 final_amount_raw={}\n\
+                 gross_profit_raw={}\n\
+                 gross_profit_token={}\n",
+                opp.input_amount(),
+                opp.intermediate_amount(),
+                opp.final_amount(),
+                opp.gross_profit(),
+                opp.input_token(),
+            )),
+            Err(RouteEvaluationFailure::InvalidRouteCandidateMapping { error }) => out.push_str(
+                &format!("status=FAILED kind=InvalidRouteCandidateMapping\nerror={error}\n"),
+            ),
+            Err(RouteEvaluationFailure::Leg1QuoteFailed { error }) => {
+                out.push_str(&format!("status=FAILED kind=Leg1QuoteFailed\nerror={error}\n"))
+            }
+            Err(RouteEvaluationFailure::Leg2QuoteFailed { leg1, error }) => out.push_str(&format!(
+                "status=FAILED kind=Leg2QuoteFailed\n\
+                 leg1_amount_in_raw={}\n\
+                 leg1_amount_out_raw={}\n\
+                 error={error}\n",
+                leg1.amount_in, leg1.amount_out,
+            )),
+            Err(RouteEvaluationFailure::OpportunityEvaluationFailed { leg1, leg2, error }) => {
+                out.push_str(&format!(
+                    "status=FAILED kind=OpportunityEvaluationFailed\n\
+                     leg1_amount_in_raw={}\n\
+                     leg1_amount_out_raw={}\n\
+                     leg2_amount_in_raw={}\n\
+                     leg2_amount_out_raw={}\n\
+                     error={error}\n",
+                    leg1.amount_in, leg1.amount_out, leg2.amount_in, leg2.amount_out,
+                ))
+            }
+        }
+    }
+
+    out.push_str(
+        "\nNOTES\n\
+         - gross_profit_raw is a raw quote difference in the smallest unit of the starting token (gross_profit_token); it is NOT net profit.\n\
+         - No gas cost is subtracted.\n\
+         - No execution or settlement cost is subtracted.\n\
+         - This is a historical quote evaluation at the pinned block, not a live opportunity or an executable trading signal.\n\
+         - No transaction is signed or submitted.\n",
+    );
+    out
+}
+
+/// Execute `inspect-arb`: read-only, block-pinned Aerodrome + Uniswap V3
+/// snapshot at one historical block, fed through the existing validated
+/// historical inputs and `detect_cross_dex_opportunities_at_block`. No
+/// signer, no transaction, no fallback to latest state; every RPC failure
+/// is propagated.
+pub async fn run_inspect_arb(
+    config: &Config,
+    aerodrome_pool: Address,
+    uniswap_v3_pool: Address,
+    block: u64,
+    token_in: Address,
+    amount_in: U256,
+    word_radius: i32,
+) -> EngineResult<()> {
+    let url = config
+        .base_rpc_url
+        .parse()
+        .map_err(|e| EngineError::Config(format!("invalid rpc url: {e}")))?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let chain_id = provider
+        .get_chain_id()
+        .await
+        .map_err(|e| EngineError::Chain(format!("get_chain_id failed: {e}")))?;
+    check_chain_id(chain_id, config.base_chain_id)?;
+
+    let aerodrome_adapter =
+        AerodromeAdapter::with_factory_address(config.aerodrome_factory_address);
+    let uniswap_adapter = UniswapV3Adapter::new();
+
+    // Placeholder identities: only `.address` is used to read; both token
+    // addresses are filled from real pinned `token0()`/`token1()` reads.
+    // `decimals: 0` is an explicit "unset" sentinel - this command never
+    // reads or uses decimals and all amounts stay raw integers.
+    let unknown_token = || Token {
+        address: Address::ZERO,
+        symbol: "UNKNOWN".into(),
+        decimals: 0,
+    };
+    let aerodrome_placeholder = Pool {
+        address: aerodrome_pool,
+        dex: DexKind::Aerodrome,
+        token0: unknown_token(),
+        token1: unknown_token(),
+        kind: PoolKind::Aerodrome {
+            reserve0: U256::ZERO,
+            reserve1: U256::ZERO,
+            stable: false,
+            fee_bps: None,
+        },
+    };
+    let uniswap_placeholder = Pool {
+        address: uniswap_v3_pool,
+        dex: DexKind::UniswapV3,
+        token0: unknown_token(),
+        token1: unknown_token(),
+        kind: PoolKind::ConcentratedLiquidity {
+            fee_tier: 0,
+            tick_spacing: 1,
+            sqrt_price_x96: U256::ZERO,
+            current_tick: 0,
+            liquidity: 0,
+            initialized_ticks: Default::default(),
+        },
+    };
+
+    let aerodrome_state = aerodrome_adapter
+        .get_pool_state_at_block(&config.base_rpc_url, &aerodrome_placeholder, block)
+        .await?;
+    let (uniswap_state, hydrated) = uniswap_adapter
+        .get_pool_state_and_ticks_at_block(
+            &config.base_rpc_url,
+            &uniswap_placeholder,
+            word_radius,
+            Some(block),
+        )
+        .await?;
+
+    let aerodrome_tokens = (
+        aerodrome_state.pool.token0.address,
+        aerodrome_state.pool.token1.address,
+    );
+    let uniswap_tokens = (
+        uniswap_state.pool.token0.address,
+        uniswap_state.pool.token1.address,
+    );
+
+    let aerodrome_input = HistoricalAerodromeInput::new(block, aerodrome_state)?;
+    let uniswap_input = HistoricalUniswapV3Input::from_pinned_read(block, (uniswap_state, hydrated))?;
+
+    validate_pair_and_direction(
+        aerodrome_pool,
+        aerodrome_tokens,
+        uniswap_v3_pool,
+        uniswap_tokens,
+        token_in,
+    )?;
+
+    let candidates = vec![
+        HistoricalQuoteInput::Aerodrome(aerodrome_input),
+        HistoricalQuoteInput::UniswapV3(uniswap_input),
+    ];
+    let outcomes = detect_cross_dex_opportunities_at_block(block, token_in, amount_in, &candidates)?;
+
+    let header = InspectArbHeader {
+        chain_id,
+        block,
+        aerodrome_pool,
+        aerodrome_tokens,
+        uniswap_v3_pool,
+        uniswap_v3_tokens: uniswap_tokens,
+        token_in,
+        amount_in,
+        word_radius,
+    };
+    println!("{}", format_inspect_arb_report(&header, &outcomes));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,5 +1586,392 @@ mod tests {
             U256::from(1u64), false, &result,
         );
         assert!(report.contains("direction=one_for_zero"));
+    }
+
+    // --- inspect-arb ---
+
+    const ARB_AERO: &str = "0xcDAC0d6c6C59727a65F871236188350531885C43";
+    const ARB_V3: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
+    const ARB_WETH: &str = "0x4200000000000000000000000000000000000006";
+    const ARB_USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+    fn arb_base_args() -> Vec<&'static str> {
+        vec![
+            "--aerodrome-pool",
+            ARB_AERO,
+            "--uniswap-v3-pool",
+            ARB_V3,
+            "--block",
+            "26000000",
+            "--token-in",
+            ARB_WETH,
+            "--amount-in",
+            "1000000000000000",
+        ]
+    }
+
+    fn arb_args_with(extra: &[&'static str]) -> Vec<String> {
+        let mut v = arb_base_args();
+        v.extend_from_slice(extra);
+        args(&v)
+    }
+
+    fn arb_args_without(flag: &str) -> Vec<String> {
+        let base = arb_base_args();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < base.len() {
+            if base[i] == flag {
+                i += 2;
+            } else {
+                out.push(base[i].to_string());
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn arb_args_replacing(flag: &str, value: &str) -> Vec<String> {
+        let mut out = arb_args_without(flag);
+        out.push(flag.to_string());
+        out.push(value.to_string());
+        out
+    }
+
+    #[test]
+    fn inspect_arb_parses_valid_command_with_default_radius() {
+        let parsed = parse_inspect_arb_args(&arb_args_with(&[])).unwrap();
+        assert_eq!(
+            parsed,
+            InspectArbCommand::Run {
+                aerodrome_pool: ARB_AERO.parse().unwrap(),
+                uniswap_v3_pool: ARB_V3.parse().unwrap(),
+                block: 26_000_000,
+                token_in: ARB_WETH.parse().unwrap(),
+                amount_in: U256::from(1_000_000_000_000_000u64),
+                word_radius: INSPECT_V3_WORD_RADIUS,
+            }
+        );
+    }
+
+    #[test]
+    fn inspect_arb_parses_explicit_word_radius() {
+        match parse_inspect_arb_args(&arb_args_with(&["--word-radius", "3"])).unwrap() {
+            InspectArbCommand::Run { word_radius, .. } => assert_eq!(word_radius, 3),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        match parse_inspect_arb_args(&arb_args_with(&["--word-radius", "0"])).unwrap() {
+            InspectArbCommand::Run { word_radius, .. } => assert_eq!(word_radius, 0),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_arb_help_short_circuits_even_with_bogus_args() {
+        assert_eq!(
+            parse_inspect_arb_args(&args(&["--help"])),
+            Ok(InspectArbCommand::Help)
+        );
+        assert_eq!(
+            parse_inspect_arb_args(&args(&["-h"])),
+            Ok(InspectArbCommand::Help)
+        );
+        assert_eq!(
+            parse_inspect_arb_args(&args(&["--bogus", "x", "--amount-in", "0", "--help"])),
+            Ok(InspectArbCommand::Help)
+        );
+    }
+
+    #[test]
+    fn inspect_arb_each_missing_required_flag_is_rejected() {
+        for flag in [
+            "--aerodrome-pool",
+            "--uniswap-v3-pool",
+            "--block",
+            "--token-in",
+            "--amount-in",
+        ] {
+            let err = parse_inspect_arb_args(&arb_args_without(flag)).unwrap_err();
+            assert!(err.contains(flag), "flag {flag}: {err}");
+            assert!(err.contains("missing required"), "flag {flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn inspect_arb_invalid_addresses_are_rejected() {
+        for flag in ["--aerodrome-pool", "--uniswap-v3-pool", "--token-in"] {
+            let err =
+                parse_inspect_arb_args(&arb_args_replacing(flag, "0xnotanaddress")).unwrap_err();
+            assert!(err.contains("invalid") && err.contains(flag), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn inspect_arb_invalid_block_is_rejected() {
+        for bad in ["abc", "-1", "1.5", "", "18446744073709551616"] {
+            let err = parse_inspect_arb_args(&arb_args_replacing("--block", bad)).unwrap_err();
+            assert!(err.contains("invalid --block"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn inspect_arb_invalid_amount_is_rejected() {
+        for bad in ["abc", "-5", "1.5", "1e18", "", "0x10"] {
+            let err = parse_inspect_arb_args(&arb_args_replacing("--amount-in", bad)).unwrap_err();
+            assert!(err.contains("invalid --amount-in"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn inspect_arb_zero_amount_is_rejected() {
+        for zero in ["0", "000"] {
+            let err = parse_inspect_arb_args(&arb_args_replacing("--amount-in", zero)).unwrap_err();
+            assert!(err.contains("greater than zero"), "{zero}: {err}");
+        }
+    }
+
+    #[test]
+    fn inspect_arb_negative_or_invalid_word_radius_is_rejected() {
+        let err = parse_inspect_arb_args(&arb_args_with(&["--word-radius", "-1"])).unwrap_err();
+        assert!(err.contains("non-negative"), "{err}");
+        let err = parse_inspect_arb_args(&arb_args_with(&["--word-radius", "x"])).unwrap_err();
+        assert!(err.contains("invalid --word-radius"), "{err}");
+    }
+
+    #[test]
+    fn inspect_arb_unknown_and_dangling_arguments_are_rejected() {
+        let err = parse_inspect_arb_args(&arb_args_with(&["--wat", "1"])).unwrap_err();
+        assert!(err.contains("unrecognized argument"), "{err}");
+        let err = parse_inspect_arb_args(&args(&["--aerodrome-pool"])).unwrap_err();
+        assert!(err.contains("requires a value"), "{err}");
+    }
+
+    #[test]
+    fn inspect_arb_check_chain_id() {
+        assert!(check_chain_id(8453, 8453).is_ok());
+        let err = check_chain_id(1, 8453).unwrap_err();
+        assert!(matches!(err, EngineError::Chain(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn inspect_arb_pair_validation() {
+        let weth: Address = ARB_WETH.parse().unwrap();
+        let usdc: Address = ARB_USDC.parse().unwrap();
+        let other: Address = "0x0000000000000000000000000000000000000abc".parse().unwrap();
+        let a: Address = ARB_AERO.parse().unwrap();
+        let v: Address = ARB_V3.parse().unwrap();
+
+        // Same pair, same order and swapped order both accepted.
+        assert!(validate_pair_and_direction(a, (weth, usdc), v, (weth, usdc), weth).is_ok());
+        assert!(validate_pair_and_direction(a, (weth, usdc), v, (usdc, weth), usdc).is_ok());
+
+        // Different pair rejected, message names both pools.
+        let err = validate_pair_and_direction(a, (weth, usdc), v, (weth, other), weth).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&a.to_string()) && msg.contains(&v.to_string()), "{msg}");
+
+        // token_in not in the pair rejected.
+        let err = validate_pair_and_direction(a, (weth, usdc), v, (weth, usdc), other).unwrap_err();
+        assert!(matches!(err, EngineError::State(_)), "got {err:?}");
+    }
+
+    // --- inspect-arb report formatting (outcomes come from the real
+    // detector, not hand-built; RouteOutcome fields are private) ---
+
+    mod arb_report {
+        use super::*;
+        use crate::arbitrage::HistoricalQuoteInput;
+        use crate::market::models::PoolState;
+
+        const BLOCK: u64 = 26_000_000;
+
+        fn weth() -> Address {
+            ARB_WETH.parse().unwrap()
+        }
+        fn usdc() -> Address {
+            ARB_USDC.parse().unwrap()
+        }
+
+        fn token(address: Address, symbol: &str, decimals: u8) -> Token {
+            Token {
+                address,
+                symbol: symbol.into(),
+                decimals,
+            }
+        }
+
+        fn aerodrome(pool_address: Address, fee_bps: Option<U256>) -> HistoricalQuoteInput {
+            let pool = Pool {
+                address: pool_address,
+                dex: DexKind::Aerodrome,
+                token0: token(weth(), "WETH", 18),
+                token1: token(usdc(), "USDC", 6),
+                kind: PoolKind::Aerodrome {
+                    reserve0: U256::from_str_radix("3607642796485591444113", 10).unwrap(),
+                    reserve1: U256::from(9_965_914_277_780u64),
+                    stable: false,
+                    fee_bps,
+                },
+            };
+            HistoricalQuoteInput::Aerodrome(
+                HistoricalAerodromeInput::new(BLOCK, PoolState::new(pool, BLOCK, None)).unwrap(),
+            )
+        }
+
+        fn v3() -> HistoricalQuoteInput {
+            let pool = Pool {
+                address: ARB_V3.parse().unwrap(),
+                dex: DexKind::UniswapV3,
+                token0: token(weth(), "WETH", 18),
+                token1: token(usdc(), "USDC", 6),
+                kind: PoolKind::ConcentratedLiquidity {
+                    fee_tier: 500,
+                    tick_spacing: 10,
+                    sqrt_price_x96: U256::from_str_radix("4166855781027983759429743", 10).unwrap(),
+                    current_tick: -197_069,
+                    liquidity: 2_241_227_707_498_366_949u128,
+                    initialized_ticks: Default::default(),
+                },
+            };
+            let mut ticks = BTreeMap::new();
+            ticks.insert(-197_070, -1_776_514_264_016_992i128);
+            let hydrated = HydratedTicks::for_test(ticks, -199_680, -192_010);
+            HistoricalQuoteInput::UniswapV3(
+                HistoricalUniswapV3Input::new(BLOCK, PoolState::new(pool, BLOCK, None), hydrated)
+                    .unwrap(),
+            )
+        }
+
+        fn header(amount_in: U256) -> InspectArbHeader {
+            InspectArbHeader {
+                chain_id: 8453,
+                block: BLOCK,
+                aerodrome_pool: ARB_AERO.parse().unwrap(),
+                aerodrome_tokens: (weth(), usdc()),
+                uniswap_v3_pool: ARB_V3.parse().unwrap(),
+                uniswap_v3_tokens: (weth(), usdc()),
+                token_in: weth(),
+                amount_in,
+                word_radius: 1,
+            }
+        }
+
+        fn mixed_outcomes(amount_in: U256) -> Vec<RouteOutcome> {
+            let bad_pool: Address = "0x0000000000000000000000000000000000000091".parse().unwrap();
+            let candidates = vec![
+                aerodrome(ARB_AERO.parse().unwrap(), Some(U256::from(30u64))),
+                aerodrome(bad_pool, None), // unhydrated fee -> real quote failure
+                v3(),
+            ];
+            detect_cross_dex_opportunities_at_block(BLOCK, weth(), amount_in, &candidates).unwrap()
+        }
+
+        #[test]
+        fn report_is_deterministic_and_prints_every_outcome() {
+            let amount = U256::from(1_000_000_000_000_000u64);
+            let outcomes = mixed_outcomes(amount);
+            assert_eq!(outcomes.len(), 4);
+            let a = format_inspect_arb_report(&header(amount), &outcomes);
+            let b = format_inspect_arb_report(&header(amount), &outcomes);
+            assert_eq!(a, b);
+            assert!(a.contains("routes_evaluated=4"));
+            for n in 1..=4 {
+                assert!(a.contains(&format!("[route {n}]")), "missing route {n}");
+            }
+            assert_eq!(a.matches("status=OK").count(), 2);
+            assert_eq!(a.matches("status=FAILED").count(), 2);
+        }
+
+        #[test]
+        fn report_has_header_fields_and_labelled_raw_amounts() {
+            let amount = U256::from(1_000_000_000_000_000u64);
+            let outcomes = mixed_outcomes(amount);
+            let r = format_inspect_arb_report(&header(amount), &outcomes);
+            for needle in [
+                "chain_id=8453",
+                "block=26000000",
+                &format!("aerodrome_pool={}", ARB_AERO.parse::<Address>().unwrap()),
+                &format!("uniswap_v3_pool={}", ARB_V3.parse::<Address>().unwrap()),
+                &format!("aerodrome_token0={}", weth()),
+                &format!("aerodrome_token1={}", usdc()),
+                &format!("uniswap_v3_token0={}", weth()),
+                &format!("uniswap_v3_token1={}", usdc()),
+                &format!("token_in={}", weth()),
+                "amount_in_raw=1000000000000000",
+                "v3_word_radius=1",
+                &format!("start_token={}", weth()),
+                &format!("intermediate_token={}", usdc()),
+                "leg1=aerodrome pool=",
+                "leg2=uniswap_v3 pool=",
+                "route_block=26000000",
+                "input_amount_raw=",
+                "intermediate_amount_raw=",
+                "final_amount_raw=",
+                "gross_profit_raw=",
+                &format!("gross_profit_token={}", weth()),
+            ] {
+                assert!(r.contains(needle), "missing {needle:?} in:\n{r}");
+            }
+        }
+
+        #[test]
+        fn report_preserves_exact_signed_gross_profit_including_negative() {
+            let amount = U256::from(1_000_000_000_000_000u64);
+            let outcomes = mixed_outcomes(amount);
+            let r = format_inspect_arb_report(&header(amount), &outcomes);
+            let mut saw_negative = false;
+            for outcome in &outcomes {
+                if let Some(opp) = outcome.opportunity() {
+                    let line = format!("gross_profit_raw={}", opp.gross_profit());
+                    assert!(r.contains(&line), "missing {line}");
+                    if opp.gross_profit().is_negative() {
+                        assert!(line.starts_with("gross_profit_raw=-"));
+                        saw_negative = true;
+                    }
+                }
+            }
+            assert!(saw_negative, "fixture should contain a negative gross profit");
+        }
+
+        #[test]
+        fn report_shows_route_failure_with_underlying_error() {
+            let amount = U256::from(1_000_000_000_000_000u64);
+            let outcomes = mixed_outcomes(amount);
+            let r = format_inspect_arb_report(&header(amount), &outcomes);
+            assert!(r.contains("status=FAILED kind=Leg"), "{r}");
+            assert!(r.contains("error="), "{r}");
+            // The failing routes must not suppress the successful ones.
+            assert!(r.contains("status=OK"));
+        }
+
+        #[test]
+        fn report_includes_the_no_gas_no_execution_disclaimer() {
+            let amount = U256::from(1_000_000_000_000_000u64);
+            let r = format_inspect_arb_report(&header(amount), &mixed_outcomes(amount));
+            for needle in [
+                "NOT net profit",
+                "No gas cost is subtracted.",
+                "No execution or settlement cost is subtracted.",
+                "not a live opportunity or an executable trading signal",
+                "No transaction is signed or submitted.",
+            ] {
+                assert!(r.contains(needle), "missing {needle:?}");
+            }
+        }
+
+        #[test]
+        fn report_with_no_matching_route_does_not_fabricate_one() {
+            let amount = U256::from(1_000u64);
+            let other: Address = "0x0000000000000000000000000000000000000abc".parse().unwrap();
+            let candidates = vec![aerodrome(ARB_AERO.parse().unwrap(), Some(U256::from(30u64))), v3()];
+            let outcomes =
+                detect_cross_dex_opportunities_at_block(BLOCK, other, amount, &candidates).unwrap();
+            assert!(outcomes.is_empty());
+            let r = format_inspect_arb_report(&header(amount), &outcomes);
+            assert!(r.contains("routes_evaluated=0"));
+            assert!(r.contains("nothing was evaluated"));
+            assert!(!r.contains("[route 1]"));
+            assert!(!r.contains("status=OK"));
+        }
     }
 }
