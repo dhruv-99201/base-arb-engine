@@ -8,12 +8,14 @@
 //! threshold, and does not execute anything - see `opportunity` module
 //! docs for the exact boundary.
 
+pub mod detect;
 pub mod historical;
 pub mod multi_quote;
 pub mod opportunity;
 pub mod quote;
 pub mod routes;
 
+pub use detect::{detect_cross_dex_opportunities_at_block, RouteEvaluationFailure, RouteOutcome};
 pub use historical::{HistoricalAerodromeInput, HistoricalUniswapV3Input};
 pub use multi_quote::{quote_historical_candidates_at_block, HistoricalQuoteInput, QuoteOutcome};
 pub use opportunity::{LegQuote, Opportunity};
