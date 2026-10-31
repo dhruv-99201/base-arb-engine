@@ -5,11 +5,15 @@ price discrepancies between Aerodrome and Uniswap V3 on Base, size trades
 optimally, simulate locally, and execute atomically via flash-loan-funded
 Solidity executor. This repository is being built incrementally, day by day.
 
-## Current scope: Day 1 + Day 2
+## Current scope: Day 1 + Day 2 + Day 3 (M4-M8)
 
 Day 1 delivered the **market-data and state foundation**. Day 2 adds
 **automated pool discovery and real protocol market-state indexing** on top
-of it, still entirely over HTTP, still entirely read-only.
+of it, still entirely over HTTP, still entirely read-only. Day 3 (M4-M8,
+documented in "Historical validation pipeline (M4-M8)" below) adds exact
+pricing math and a **read-only, historical** cross-DEX quote-evaluation
+pipeline. It is a research/validation tool: it produces raw gross quote
+differences at a pinned past block, not live or executable trading signals.
 
 ### Day 1
 
@@ -133,7 +137,10 @@ BlockState -> MarketState             +--> Discovery scan (factory logs)
                                         freshness-tracked)
                                                 |
                                                 v
-                                       Opportunity Engine    <-- DAY 3+
+                                       Opportunity Engine    <-- DAY 3: historical,
+                                                                  read-only (M4-M8,
+                                                                  see below); no live
+                                                                  scanner yet
                                                 |
                                                 v
                                        REVM Simulator         <-- LATER
@@ -258,10 +265,92 @@ name/signature used to compute the filter is wrong; if they match but
 the problem instead. Also read-only: no private key, no signing, no state
 changes.
 
+## Historical validation pipeline (M4-M8)
+
+Day 3 added exact pricing math and a read-only pipeline that evaluates
+cross-DEX round trips against **real pool state pinned to one historical
+block**. Nothing here is live, nothing is net of costs, and nothing signs
+or submits a transaction.
+
+- **Exact pricing math** (`src/pricing`): integer-only Uniswap V3 swap
+  simulation (FullMath, TickMath, TickBitmap, SqrtPriceMath, SwapMath,
+  tick-crossing `quote_exact_input`) and Aerodrome Classic **volatile**
+  constant-product quoting using the pool's real per-pool factory fee,
+  with historical golden regression fixtures. Aerodrome stable-curve and
+  Slipstream pricing are **not** implemented.
+- **Quote bridges and opportunity evaluator** (`arbitrage::quote`,
+  `arbitrage::opportunity`): turn a pool state (plus hydrated ticks for
+  V3) into a `LegQuote`, and combine two chained legs into an
+  `Opportunity` with exact signed integer
+  `gross_profit = final_amount - input_amount`.
+- **M6A-M6D - cross-DEX detection** (`arbitrage::{historical, multi_quote,
+  routes, detect}`): validated block-pinned inputs, per-pool quotes,
+  enumeration of two-pool cross-DEX round trips, and a detector that
+  evaluates every route. A failure in one route never hides the others;
+  negative and zero results are kept.
+- **M7 - `inspect-arb`**: reads one Aerodrome Classic and one Uniswap V3
+  pool at a historical block and runs the detector.
+- **M8 - `scan-arb`**: the same for a set of pools you supply.
+
+All historical reads are pinned by block **number** (not block hash) and
+need an archive-capable `BASE_RPC_URL` when the block is outside the
+provider's retained state window. There is no fallback to latest state.
+
+### `inspect-arb`: one Aerodrome pool x one Uniswap V3 pool
+
+```bash
+cargo run -- inspect-arb --help
+cargo run -- inspect-arb --aerodrome-pool <ADDRESS> --uniswap-v3-pool <ADDRESS> \
+  --block <U64> --token-in <ADDRESS> --amount-in <DECIMAL_INTEGER> [--word-radius <I32>]
+```
+
+### `scan-arb`: many Aerodrome pools x many Uniswap V3 pools
+
+```bash
+cargo run -- scan-arb --help
+cargo run -- scan-arb \
+  --aerodrome-pool 0xAEROPOOL1 --aerodrome-pool 0xAEROPOOL2 \
+  --uniswap-v3-pool 0xV3POOL1 --uniswap-v3-pool 0xV3POOL2 \
+  --block <U64> --token-in <ADDRESS> --amount-in <DECIMAL_INTEGER> [--word-radius <I32>]
+```
+
+- `--aerodrome-pool` and `--uniswap-v3-pool` are **repeatable**; at least
+  one of each is required. Duplicate addresses (within a list or across
+  both) are rejected, and every argument is validated before configuration
+  is loaded or any RPC call is made. `--help` never needs a `.env`.
+- Every pool is read **sequentially** at the one requested `--block`
+  (chain ID is checked against `BASE_CHAIN_ID` first). A pool that fails
+  to load (RPC, hydration or validation) is reported as its own failed
+  load and the remaining pools are still evaluated.
+- The existing detector is called once over the pools that loaded, and
+  the report prints every pool load result and **every** route outcome -
+  nothing is sorted or filtered by profit, and quote failures and
+  negative/zero profits are shown.
+- `gross_profit_raw` is a signed integer in the smallest unit of the
+  starting token (`--token-in`). `--amount-in` is likewise in that token's
+  smallest unit.
+
+**Limitations of `inspect-arb` / `scan-arb`:**
+
+- Gross profit is **not** net profit: no gas, execution or settlement cost
+  is subtracted, and there is no USD conversion.
+- It is historical research, not a live trading signal; a past quote says
+  nothing about what is executable now.
+- Only the pool addresses **you supply** are scanned. There is no
+  automatic pool discovery here and no claim to cover all Base pools.
+- Aerodrome Classic **volatile** and Uniswap V3 only (stable pools are
+  rejected; Slipstream is not treated as Uniswap V3).
+- One block, one input amount, two-pool round trips only. No trade-size
+  optimization, no multi-block backtesting, no multi-hop routing.
+- V3 tick data covers only `--word-radius` bitmap words around the
+  current tick (default 1); a swap that needs ticks beyond that range is
+  reported as a quote failure, not guessed.
+
 ## Test
 
 ```bash
 cargo test
+cargo test --all-targets
 ```
 
 ## Safety
@@ -281,9 +370,14 @@ cargo test
 ## Not implemented yet
 
 - Optimal trade sizing
-- Full Uniswap V3 / Slipstream swap-simulation pricing math (tick-bitmap
-  walking)
-- Arbitrage opportunity detection
+- Aerodrome Slipstream pricing math and Aerodrome stable-curve pricing
+  (Uniswap V3 swap simulation with tick-bitmap walking **is** implemented,
+  as is Aerodrome volatile quoting - see M4 above)
+- Live/continuous arbitrage detection. Historical cross-DEX detection over
+  operator-supplied pools **is** implemented (`inspect-arb`/`scan-arb`),
+  but there is no live scanner, no automatic pool selection, and no gas
+  or net-profit model
+- Historical backtesting across block ranges
 - REVM local simulation
 - Balancer V2 flash loans
 - `ArbExecutor.sol`

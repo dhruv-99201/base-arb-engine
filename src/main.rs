@@ -121,6 +121,41 @@ async fn main() -> EngineResult<()> {
         };
     }
 
+    if raw_args.len() > 1 && raw_args[1] == "scan-arb" {
+        return match cli::parse_scan_arb_args(&raw_args[2..]) {
+            Ok(cli::ScanArbCommand::Help) => {
+                println!("{}", cli::SCAN_ARB_USAGE);
+                Ok(())
+            }
+            Ok(cli::ScanArbCommand::Run {
+                aerodrome_pools,
+                uniswap_v3_pools,
+                block,
+                token_in,
+                amount_in,
+                word_radius,
+            }) => {
+                let config = Config::load()?;
+                telemetry::init_tracing(&config.log_level);
+                cli::run_scan_arb(
+                    &config,
+                    aerodrome_pools,
+                    uniswap_v3_pools,
+                    block,
+                    token_in,
+                    amount_in,
+                    word_radius,
+                )
+                .await
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", cli::SCAN_ARB_USAGE);
+                std::process::exit(2)
+            }
+        };
+    }
+
     let config = Config::load()?;
     telemetry::init_tracing(&config.log_level);
 

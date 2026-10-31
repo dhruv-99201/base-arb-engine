@@ -21,7 +21,7 @@ use crate::arbitrage::{
 };
 use crate::dex::{AerodromeAdapter, UniswapV3Adapter};
 use crate::error::{EngineError, EngineResult};
-use crate::market::models::{DexKind, Pool, PoolKind, Token};
+use crate::market::models::{DexKind, Pool, PoolKind, PoolState, Token};
 use crate::pricing::v3_quote::{quote_exact_input, HydratedTicks, HydratedV3State, V3QuoteResult};
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -1065,6 +1065,563 @@ pub async fn run_inspect_arb(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// scan-arb (M8): multi-pool historical cross-DEX scan over an
+// operator-supplied set of Aerodrome Classic + Uniswap V3 pool addresses.
+// Read-only; reuses the M7 pinned readers and the M6 detector unchanged.
+// ---------------------------------------------------------------------------
+
+pub const SCAN_ARB_USAGE: &str = "\
+Usage: cargo run -- scan-arb --aerodrome-pool <ADDRESS> [--aerodrome-pool <ADDRESS> ...] --uniswap-v3-pool <ADDRESS> [--uniswap-v3-pool <ADDRESS> ...] --block <U64> --token-in <ADDRESS> --amount-in <DECIMAL_INTEGER> [--word-radius <I32>]
+
+Read-only historical multi-pool cross-DEX scan. Loads every operator-supplied
+Aerodrome Classic pool and Uniswap V3 pool (with hydrated ticks) at ONE
+identical historical block number, sequentially, and evaluates every valid
+cross-DEX route among the successfully loaded pools with the existing
+cross-DEX opportunity detector. Prints every pool load result and EVERY
+route outcome (successes, losses, zero-profit routes and quote failures);
+nothing is sorted or filtered by profit.
+
+A pool that fails to load (RPC, hydration or validation error) is reported
+as its own failed load and the remaining pools are still evaluated.
+
+This scans ONLY the pool addresses you supply. It does not discover pools
+and does not claim to scan all Base pools.
+
+gross_profit_raw is a raw quote difference in the smallest unit of the
+starting token. It is NOT net profit: no gas cost and no execution or
+settlement cost is subtracted, this is historical research and not a live
+trading signal, and no transaction is ever signed or submitted. No USD
+conversion is attempted.
+
+Uses BASE_RPC_URL from your environment/.env. A historical read at --block
+requires an archive-capable RPC endpoint when that block is outside the
+provider's retained state window; there is no fallback to latest state.
+Reads are pinned by block number, not by block hash.
+
+Options:
+  --aerodrome-pool <ADDRESS>   Aerodrome Classic (volatile) pool address.
+                               Repeatable; at least one required.
+  --uniswap-v3-pool <ADDRESS>  Uniswap V3 pool address. Repeatable; at
+                               least one required.
+  --block <U64>                Historical block every read is pinned to. Required.
+  --token-in <ADDRESS>         Starting token. Required.
+  --amount-in <DECIMAL_INTEGER>
+                               Positive base-10 integer in the starting
+                               token's smallest units. No floating point. Required.
+  --word-radius <I32>          Non-negative V3 tick-bitmap word radius
+                               (default: 1, same as inspect-v3/inspect-arb).
+  --help, -h                   Show this help and exit.
+
+Duplicate pool addresses (within one list or across both) are rejected
+before any network access.
+
+Example:
+  cargo run -- scan-arb --aerodrome-pool 0xcDAC0d6c6C59727a65F871236188350531885C43 --uniswap-v3-pool 0xd0b53D9277642d899DF5C87A3966A349A798F224 --block 26000000 --token-in 0x4200000000000000000000000000000000000006 --amount-in 1000000000000000
+";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanArbCommand {
+    Help,
+    Run {
+        aerodrome_pools: Vec<Address>,
+        uniswap_v3_pools: Vec<Address>,
+        block: u64,
+        token_in: Address,
+        amount_in: U256,
+        word_radius: i32,
+    },
+}
+
+/// Parse `scan-arb` arguments (everything after `scan-arb`). Pure - no I/O.
+/// `--help`/`-h` wins over everything else. Every value is validated here,
+/// before any config load or RPC call. Pool order is the order supplied.
+pub fn parse_scan_arb_args(args: &[String]) -> Result<ScanArbCommand, String> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(ScanArbCommand::Help);
+    }
+
+    fn value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a String, String> {
+        args.get(i + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))
+    }
+
+    let mut aerodrome_pools: Vec<Address> = Vec::new();
+    let mut uniswap_v3_pools: Vec<Address> = Vec::new();
+    let mut block: Option<u64> = None;
+    let mut token_in: Option<Address> = None;
+    let mut amount_in: Option<U256> = None;
+    let mut word_radius = INSPECT_V3_WORD_RADIUS;
+    let mut seen: std::collections::HashMap<Address, &'static str> =
+        std::collections::HashMap::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            flag @ ("--aerodrome-pool" | "--uniswap-v3-pool") => {
+                let flag: &'static str = if flag == "--aerodrome-pool" {
+                    "--aerodrome-pool"
+                } else {
+                    "--uniswap-v3-pool"
+                };
+                let raw = value(args, i, flag)?;
+                let addr = raw
+                    .parse::<Address>()
+                    .map_err(|_| format!("invalid {flag} value: '{raw}'"))?;
+                if let Some(first_flag) = seen.insert(addr, flag) {
+                    return Err(format!(
+                        "duplicate pool address {addr}: supplied via {first_flag} and again via \
+                         {flag}; every pool address must be unique"
+                    ));
+                }
+                if flag == "--aerodrome-pool" {
+                    aerodrome_pools.push(addr);
+                } else {
+                    uniswap_v3_pools.push(addr);
+                }
+            }
+            "--block" => {
+                let raw = value(args, i, "--block")?;
+                block = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("invalid --block value: '{raw}'"))?,
+                );
+            }
+            "--token-in" => {
+                let raw = value(args, i, "--token-in")?;
+                token_in = Some(
+                    raw.parse::<Address>()
+                        .map_err(|_| format!("invalid --token-in value: '{raw}'"))?,
+                );
+            }
+            "--amount-in" => {
+                let raw = value(args, i, "--amount-in")?;
+                // `U256::from_str_radix("", 10)` yields 0 rather than an
+                // error, so an empty value must be rejected explicitly.
+                let parsed = if raw.is_empty() {
+                    None
+                } else {
+                    U256::from_str_radix(raw, 10).ok()
+                }
+                .ok_or_else(|| {
+                    format!(
+                        "invalid --amount-in value: '{raw}' (expected a positive base-10 \
+                         integer, no floating point)"
+                    )
+                })?;
+                if parsed.is_zero() {
+                    return Err("--amount-in must be greater than zero".to_string());
+                }
+                amount_in = Some(parsed);
+            }
+            "--word-radius" => {
+                let raw = value(args, i, "--word-radius")?;
+                let parsed = raw.parse::<i32>().map_err(|_| {
+                    format!(
+                        "invalid --word-radius value: '{raw}' (expected a non-negative integer)"
+                    )
+                })?;
+                if parsed < 0 {
+                    return Err(format!("--word-radius must be non-negative, got {parsed}"));
+                }
+                word_radius = parsed;
+            }
+            other => return Err(format!("unrecognized argument: '{other}'")),
+        }
+        i += 2;
+    }
+
+    if aerodrome_pools.is_empty() {
+        return Err("missing required --aerodrome-pool <ADDRESS> (at least one)".to_string());
+    }
+    if uniswap_v3_pools.is_empty() {
+        return Err("missing required --uniswap-v3-pool <ADDRESS> (at least one)".to_string());
+    }
+
+    Ok(ScanArbCommand::Run {
+        aerodrome_pools,
+        uniswap_v3_pools,
+        block: block.ok_or_else(|| "missing required --block <U64>".to_string())?,
+        token_in: token_in.ok_or_else(|| "missing required --token-in <ADDRESS>".to_string())?,
+        amount_in: amount_in
+            .ok_or_else(|| "missing required --amount-in <DECIMAL_INTEGER>".to_string())?,
+        word_radius,
+    })
+}
+
+/// One pool's raw pinned read, as returned by the existing adapters. The
+/// Uniswap V3 variant carries the `(PoolState, HydratedTicks)` pair exactly
+/// as `get_pool_state_and_ticks_at_block` produced it.
+#[derive(Debug)]
+pub enum PinnedPoolRead {
+    Aerodrome(PoolState),
+    UniswapV3(PoolState, HydratedTicks),
+}
+
+/// One pool's own load result. `result` is `Ok((token0, token1))` (the real
+/// on-chain addresses of a pool that is now a validated candidate) or the
+/// specific error that kept this pool out of the scan.
+#[derive(Debug)]
+pub struct PoolLoadOutcome {
+    pub dex: DexKind,
+    pub address: Address,
+    pub result: EngineResult<(Address, Address)>,
+}
+
+/// Pool-specific identity sanity checks, applied at load time so one bad
+/// pool fails ALONE instead of triggering the route enumerator's
+/// collection-level abort (it rejects identical token0/token1 for the
+/// whole candidate set).
+fn validate_loaded_identity(
+    requested: Address,
+    requested_dex: DexKind,
+    pool_state: &PoolState,
+) -> EngineResult<(Address, Address)> {
+    let pool = &pool_state.pool;
+    if pool.address != requested || pool.dex != requested_dex {
+        return Err(EngineError::State(format!(
+            "scan-arb: requested {requested_dex:?} pool {requested} but the read returned \
+             {:?} pool {}; refusing to substitute",
+            pool.dex, pool.address
+        )));
+    }
+    let (t0, t1) = (pool.token0.address, pool.token1.address);
+    if t0 == Address::ZERO || t1 == Address::ZERO || t0 == t1 {
+        return Err(EngineError::State(format!(
+            "scan-arb: pool {requested} has an unusable token pair (token0={t0}, token1={t1})"
+        )));
+    }
+    Ok((t0, t1))
+}
+
+/// Pure candidate construction: turns each pool's raw read (or its read
+/// error) into that pool's own [`PoolLoadOutcome`] and, for each success,
+/// a validated `HistoricalQuoteInput`. Nothing here aborts the batch - a
+/// failure in one pool never suppresses another. Outcome order equals
+/// input order; candidate order equals the order of successful outcomes.
+pub fn build_scan_candidates(
+    block: u64,
+    reads: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)>,
+) -> (Vec<PoolLoadOutcome>, Vec<HistoricalQuoteInput>) {
+    let mut outcomes = Vec::with_capacity(reads.len());
+    let mut candidates = Vec::new();
+
+    for (dex, address, read) in reads {
+        let built: EngineResult<((Address, Address), HistoricalQuoteInput)> =
+            read.and_then(|r| match (dex, r) {
+                (DexKind::Aerodrome, PinnedPoolRead::Aerodrome(state)) => {
+                    let tokens = validate_loaded_identity(address, dex, &state)?;
+                    let input = HistoricalAerodromeInput::new(block, state)?;
+                    Ok((tokens, HistoricalQuoteInput::Aerodrome(input)))
+                }
+                (DexKind::UniswapV3, PinnedPoolRead::UniswapV3(state, ticks)) => {
+                    let tokens = validate_loaded_identity(address, dex, &state)?;
+                    let input = HistoricalUniswapV3Input::from_pinned_read(block, (state, ticks))?;
+                    Ok((tokens, HistoricalQuoteInput::UniswapV3(input)))
+                }
+                (expected, _) => Err(EngineError::State(format!(
+                    "scan-arb: pool {address} was read with the wrong adapter for {expected:?}"
+                ))),
+            });
+        match built {
+            Ok((tokens, candidate)) => {
+                outcomes.push(PoolLoadOutcome {
+                    dex,
+                    address,
+                    result: Ok(tokens),
+                });
+                candidates.push(candidate);
+            }
+            Err(error) => outcomes.push(PoolLoadOutcome {
+                dex,
+                address,
+                result: Err(error),
+            }),
+        }
+    }
+    (outcomes, candidates)
+}
+
+/// Request/snapshot facts printed at the top of the `scan-arb` report.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanArbHeader {
+    pub chain_id: u64,
+    pub block: u64,
+    pub token_in: Address,
+    pub amount_in: U256,
+    pub word_radius: i32,
+}
+
+/// Deterministic `scan-arb` report. Pure: same inputs, same string. Prints
+/// every pool load outcome and every route outcome in the order given - no
+/// sorting, no filtering. `detection` is the detector's own top-level
+/// result; if it is an error it is printed, never hidden.
+pub fn format_scan_arb_report(
+    header: &ScanArbHeader,
+    loads: &[PoolLoadOutcome],
+    detection: &EngineResult<Vec<RouteOutcome>>,
+) -> String {
+    let count = |dex: DexKind, ok: Option<bool>| {
+        loads
+            .iter()
+            .filter(|l| l.dex == dex && ok.is_none_or(|want| l.result.is_ok() == want))
+            .count()
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "scan-arb report\n\
+         chain_id={}\n\
+         block={}\n\
+         token_in={}\n\
+         amount_in_raw={}\n\
+         v3_word_radius={}\n\
+         aerodrome_pools_requested={}\n\
+         aerodrome_pools_loaded={}\n\
+         aerodrome_pools_failed={}\n\
+         uniswap_v3_pools_requested={}\n\
+         uniswap_v3_pools_loaded={}\n\
+         uniswap_v3_pools_failed={}\n",
+        header.chain_id,
+        header.block,
+        header.token_in,
+        header.amount_in,
+        header.word_radius,
+        count(DexKind::Aerodrome, None),
+        count(DexKind::Aerodrome, Some(true)),
+        count(DexKind::Aerodrome, Some(false)),
+        count(DexKind::UniswapV3, None),
+        count(DexKind::UniswapV3, Some(true)),
+        count(DexKind::UniswapV3, Some(false)),
+    ));
+
+    for (idx, load) in loads.iter().enumerate() {
+        out.push_str(&format!(
+            "\n[pool {}]\ndex={}\npool={}\n",
+            idx + 1,
+            load.dex,
+            load.address
+        ));
+        match &load.result {
+            Ok((t0, t1)) => {
+                out.push_str(&format!("load_status=LOADED\ntoken0={t0}\ntoken1={t1}\n"))
+            }
+            Err(error) => out.push_str(&format!("load_status=FAILED\nerror={error}\n")),
+        }
+    }
+
+    match detection {
+        Err(error) => {
+            out.push_str(&format!(
+                "\nroute_detection=FAILED\nerror={error}\nroutes_evaluated=0\n"
+            ));
+        }
+        Ok(outcomes) => {
+            out.push_str(&format!("\nroutes_evaluated={}\n", outcomes.len()));
+            if outcomes.is_empty() {
+                out.push_str(
+                    "no cross-DEX route matched the requested token_in among the loaded pools; \
+                     zero routes were evaluated\n",
+                );
+            }
+            for (idx, outcome) in outcomes.iter().enumerate() {
+                let route = outcome.route();
+                out.push_str(&format!(
+                    "\n[route {}]\n\
+                     start_token={}\n\
+                     intermediate_token={}\n\
+                     leg1={} pool={}\n\
+                     leg2={} pool={}\n\
+                     route_block={}\n",
+                    idx + 1,
+                    route.starting_token(),
+                    route.intermediate_token(),
+                    route.leg1().dex(),
+                    route.leg1().pool_address(),
+                    route.leg2().dex(),
+                    route.leg2().pool_address(),
+                    route.block(),
+                ));
+                match outcome.result() {
+                    Ok(opp) => out.push_str(&format!(
+                        "status=OK\n\
+                         input_amount_raw={}\n\
+                         intermediate_amount_raw={}\n\
+                         final_amount_raw={}\n\
+                         gross_profit_raw={}\n\
+                         gross_profit_token={}\n",
+                        opp.input_amount(),
+                        opp.intermediate_amount(),
+                        opp.final_amount(),
+                        opp.gross_profit(),
+                        opp.input_token(),
+                    )),
+                    Err(RouteEvaluationFailure::InvalidRouteCandidateMapping { error }) => out
+                        .push_str(&format!(
+                            "status=FAILED kind=InvalidRouteCandidateMapping\nerror={error}\n"
+                        )),
+                    Err(RouteEvaluationFailure::Leg1QuoteFailed { error }) => out.push_str(
+                        &format!("status=FAILED kind=Leg1QuoteFailed\nerror={error}\n"),
+                    ),
+                    Err(RouteEvaluationFailure::Leg2QuoteFailed { leg1, error }) => {
+                        out.push_str(&format!(
+                            "status=FAILED kind=Leg2QuoteFailed\n\
+                             leg1_amount_in_raw={}\n\
+                             leg1_amount_out_raw={}\n\
+                             error={error}\n",
+                            leg1.amount_in, leg1.amount_out,
+                        ))
+                    }
+                    Err(RouteEvaluationFailure::OpportunityEvaluationFailed {
+                        leg1,
+                        leg2,
+                        error,
+                    }) => out.push_str(&format!(
+                        "status=FAILED kind=OpportunityEvaluationFailed\n\
+                         leg1_amount_in_raw={}\n\
+                         leg1_amount_out_raw={}\n\
+                         leg2_amount_in_raw={}\n\
+                         leg2_amount_out_raw={}\n\
+                         error={error}\n",
+                        leg1.amount_in, leg1.amount_out, leg2.amount_in, leg2.amount_out,
+                    )),
+                }
+            }
+        }
+    }
+
+    out.push_str(
+        "\nNOTES\n\
+         - gross_profit_raw is a raw quote difference in the smallest unit of the starting token (gross_profit_token); it is NOT net profit.\n\
+         - No gas cost is subtracted.\n\
+         - No execution or settlement cost is subtracted.\n\
+         - This is historical research at the pinned block, not a live trading signal or an executable opportunity.\n\
+         - No transaction is signed or submitted.\n\
+         - Only the pool addresses supplied by the operator were scanned; this does not claim to scan all Base pools.\n",
+    );
+    out
+}
+
+/// Placeholder identity for an Aerodrome pool read: only `.address` is
+/// used; token addresses are filled from the real pinned reads. `decimals:
+/// 0` is an explicit "unset" sentinel (never read or used here).
+fn scan_placeholder_aerodrome_pool(address: Address) -> Pool {
+    let unknown = || Token {
+        address: Address::ZERO,
+        symbol: "UNKNOWN".into(),
+        decimals: 0,
+    };
+    Pool {
+        address,
+        dex: DexKind::Aerodrome,
+        token0: unknown(),
+        token1: unknown(),
+        kind: PoolKind::Aerodrome {
+            reserve0: U256::ZERO,
+            reserve1: U256::ZERO,
+            stable: false,
+            fee_bps: None,
+        },
+    }
+}
+
+fn scan_placeholder_v3_pool(address: Address) -> Pool {
+    let unknown = || Token {
+        address: Address::ZERO,
+        symbol: "UNKNOWN".into(),
+        decimals: 0,
+    };
+    Pool {
+        address,
+        dex: DexKind::UniswapV3,
+        token0: unknown(),
+        token1: unknown(),
+        kind: PoolKind::ConcentratedLiquidity {
+            fee_tier: 0,
+            tick_spacing: 1,
+            sqrt_price_x96: U256::ZERO,
+            current_tick: 0,
+            liquidity: 0,
+            initialized_ticks: Default::default(),
+        },
+    }
+}
+
+/// Execute `scan-arb`: verify the chain ID, then read every supplied pool
+/// SEQUENTIALLY (Aerodrome pools first, then Uniswap V3 pools, each in the
+/// order supplied) pinned to the one requested block, isolate per-pool
+/// failures, and call the existing detector once over the successfully
+/// loaded candidates. Read-only: no signer, no transaction, no fallback to
+/// latest state.
+pub async fn run_scan_arb(
+    config: &Config,
+    aerodrome_pools: Vec<Address>,
+    uniswap_v3_pools: Vec<Address>,
+    block: u64,
+    token_in: Address,
+    amount_in: U256,
+    word_radius: i32,
+) -> EngineResult<()> {
+    let url = config
+        .base_rpc_url
+        .parse()
+        .map_err(|e| EngineError::Config(format!("invalid rpc url: {e}")))?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let chain_id = provider
+        .get_chain_id()
+        .await
+        .map_err(|e| EngineError::Chain(format!("get_chain_id failed: {e}")))?;
+    check_chain_id(chain_id, config.base_chain_id)?;
+
+    let aerodrome_adapter =
+        AerodromeAdapter::with_factory_address(config.aerodrome_factory_address);
+    let uniswap_adapter = UniswapV3Adapter::new();
+
+    let mut reads: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> =
+        Vec::with_capacity(aerodrome_pools.len() + uniswap_v3_pools.len());
+
+    for address in aerodrome_pools {
+        let read = aerodrome_adapter
+            .get_pool_state_at_block(
+                &config.base_rpc_url,
+                &scan_placeholder_aerodrome_pool(address),
+                block,
+            )
+            .await
+            .map(PinnedPoolRead::Aerodrome);
+        reads.push((DexKind::Aerodrome, address, read));
+    }
+    for address in uniswap_v3_pools {
+        let read = uniswap_adapter
+            .get_pool_state_and_ticks_at_block(
+                &config.base_rpc_url,
+                &scan_placeholder_v3_pool(address),
+                word_radius,
+                Some(block),
+            )
+            .await
+            .map(|(state, ticks)| PinnedPoolRead::UniswapV3(state, ticks));
+        reads.push((DexKind::UniswapV3, address, read));
+    }
+
+    let (loads, candidates) = build_scan_candidates(block, reads);
+    let detection =
+        detect_cross_dex_opportunities_at_block(block, token_in, amount_in, &candidates);
+
+    let header = ScanArbHeader {
+        chain_id,
+        block,
+        token_in,
+        amount_in,
+        word_radius,
+    };
+    println!("{}", format_scan_arb_report(&header, &loads, &detection));
+
+    // The report above already shows any detector-level error; still
+    // surface it as a failing exit status rather than swallowing it.
+    detection.map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1972,6 +2529,695 @@ mod tests {
             assert!(r.contains("nothing was evaluated"));
             assert!(!r.contains("[route 1]"));
             assert!(!r.contains("status=OK"));
+        }
+    }
+
+    // --- scan-arb (M8) ---
+
+    mod scan_arb_tests {
+        use super::*;
+        use crate::arbitrage::HistoricalQuoteInput;
+
+        const BLOCK: u64 = 26_000_000;
+        const AERO_1: &str = "0xcDAC0d6c6C59727a65F871236188350531885C43";
+        const AERO_2: &str = "0x0000000000000000000000000000000000000a02";
+        const V3_1: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
+        const V3_2: &str = "0x0000000000000000000000000000000000000b02";
+        const WETH: &str = "0x4200000000000000000000000000000000000006";
+        const USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        const OTHER: &str = "0x0000000000000000000000000000000000000abc";
+
+        fn a(s: &str) -> Address {
+            s.parse().unwrap()
+        }
+
+        fn scan_args(pairs: &[(&str, &str)]) -> Vec<String> {
+            let mut v = Vec::new();
+            for (flag, value) in pairs {
+                v.push(flag.to_string());
+                v.push(value.to_string());
+            }
+            v
+        }
+
+        fn base_pairs() -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("--aerodrome-pool", AERO_1),
+                ("--uniswap-v3-pool", V3_1),
+                ("--block", "26000000"),
+                ("--token-in", WETH),
+                ("--amount-in", "1000000000000000"),
+            ]
+        }
+
+        fn without(flag: &str) -> Vec<String> {
+            scan_args(
+                &base_pairs()
+                    .into_iter()
+                    .filter(|(f, _)| *f != flag)
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        fn replacing(flag: &str, value: &'static str) -> Vec<String> {
+            let mut pairs: Vec<(&str, &str)> = base_pairs()
+                .into_iter()
+                .filter(|(f, _)| *f != flag)
+                .collect();
+            pairs.push((flag, value));
+            scan_args(&pairs)
+        }
+
+        fn with_extra(extra: &[(&'static str, &'static str)]) -> Vec<String> {
+            let mut pairs = base_pairs();
+            pairs.extend_from_slice(extra);
+            scan_args(&pairs)
+        }
+
+        // ---- parser ----
+
+        #[test]
+        fn parses_repeated_aerodrome_pool_flags_in_order() {
+            let parsed = parse_scan_arb_args(&with_extra(&[("--aerodrome-pool", AERO_2)])).unwrap();
+            match parsed {
+                ScanArbCommand::Run {
+                    aerodrome_pools,
+                    uniswap_v3_pools,
+                    block,
+                    token_in,
+                    amount_in,
+                    word_radius,
+                } => {
+                    assert_eq!(aerodrome_pools, vec![a(AERO_1), a(AERO_2)]);
+                    assert_eq!(uniswap_v3_pools, vec![a(V3_1)]);
+                    assert_eq!(block, 26_000_000);
+                    assert_eq!(token_in, a(WETH));
+                    assert_eq!(amount_in, U256::from(1_000_000_000_000_000u64));
+                    assert_eq!(word_radius, INSPECT_V3_WORD_RADIUS);
+                }
+                other => panic!("expected Run, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parses_repeated_uniswap_v3_pool_flags_in_order() {
+            let parsed = parse_scan_arb_args(&with_extra(&[("--uniswap-v3-pool", V3_2)])).unwrap();
+            match parsed {
+                ScanArbCommand::Run {
+                    aerodrome_pools,
+                    uniswap_v3_pools,
+                    ..
+                } => {
+                    assert_eq!(aerodrome_pools, vec![a(AERO_1)]);
+                    assert_eq!(uniswap_v3_pools, vec![a(V3_1), a(V3_2)]);
+                }
+                other => panic!("expected Run, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parses_explicit_word_radius_including_zero() {
+            for (raw, want) in [("3", 3), ("0", 0)] {
+                match parse_scan_arb_args(&with_extra(&[("--word-radius", raw)])).unwrap() {
+                    ScanArbCommand::Run { word_radius, .. } => assert_eq!(word_radius, want),
+                    other => panic!("expected Run, got {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn help_short_circuits_even_with_bogus_args() {
+            assert_eq!(
+                parse_scan_arb_args(&args(&["--help"])),
+                Ok(ScanArbCommand::Help)
+            );
+            assert_eq!(
+                parse_scan_arb_args(&args(&["-h"])),
+                Ok(ScanArbCommand::Help)
+            );
+            assert_eq!(
+                parse_scan_arb_args(&args(&["--bogus", "x", "--amount-in", "0", "--help"])),
+                Ok(ScanArbCommand::Help)
+            );
+        }
+
+        #[test]
+        fn missing_aerodrome_or_uniswap_v3_pool_is_rejected() {
+            let err = parse_scan_arb_args(&without("--aerodrome-pool")).unwrap_err();
+            assert!(
+                err.contains("--aerodrome-pool") && err.contains("at least one"),
+                "{err}"
+            );
+            let err = parse_scan_arb_args(&without("--uniswap-v3-pool")).unwrap_err();
+            assert!(
+                err.contains("--uniswap-v3-pool") && err.contains("at least one"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn missing_other_required_arguments_are_rejected() {
+            for flag in ["--block", "--token-in", "--amount-in"] {
+                let err = parse_scan_arb_args(&without(flag)).unwrap_err();
+                assert!(
+                    err.contains("missing required") && err.contains(flag),
+                    "{flag}: {err}"
+                );
+            }
+            let err = parse_scan_arb_args(&[]).unwrap_err();
+            assert!(err.contains("missing required"), "{err}");
+        }
+
+        #[test]
+        fn duplicate_address_within_aerodrome_list_is_rejected() {
+            let err =
+                parse_scan_arb_args(&with_extra(&[("--aerodrome-pool", AERO_1)])).unwrap_err();
+            assert!(err.contains("duplicate pool address"), "{err}");
+            assert!(err.contains(&a(AERO_1).to_string()), "{err}");
+        }
+
+        #[test]
+        fn duplicate_address_within_uniswap_list_is_rejected() {
+            let err = parse_scan_arb_args(&with_extra(&[("--uniswap-v3-pool", V3_1)])).unwrap_err();
+            assert!(err.contains("duplicate pool address"), "{err}");
+        }
+
+        #[test]
+        fn duplicate_address_across_lists_is_rejected_both_ways() {
+            // V3 address also supplied as an Aerodrome pool.
+            let err = parse_scan_arb_args(&with_extra(&[("--aerodrome-pool", V3_1)])).unwrap_err();
+            assert!(err.contains("duplicate pool address"), "{err}");
+            assert!(
+                err.contains("--aerodrome-pool") && err.contains("--uniswap-v3-pool"),
+                "{err}"
+            );
+            // Aerodrome address also supplied as a V3 pool.
+            let err =
+                parse_scan_arb_args(&with_extra(&[("--uniswap-v3-pool", AERO_1)])).unwrap_err();
+            assert!(err.contains("duplicate pool address"), "{err}");
+        }
+
+        #[test]
+        fn duplicate_detection_ignores_address_case() {
+            let lower = "0xcdac0d6c6c59727a65f871236188350531885c43";
+            let err = parse_scan_arb_args(&with_extra(&[("--aerodrome-pool", lower)])).unwrap_err();
+            assert!(err.contains("duplicate pool address"), "{err}");
+        }
+
+        #[test]
+        fn malformed_addresses_are_rejected() {
+            for flag in ["--aerodrome-pool", "--uniswap-v3-pool", "--token-in"] {
+                let err = parse_scan_arb_args(&replacing(flag, "0xnotanaddress")).unwrap_err();
+                assert!(
+                    err.contains("invalid") && err.contains(flag),
+                    "{flag}: {err}"
+                );
+            }
+            // A malformed repeated pool flag too.
+            let err =
+                parse_scan_arb_args(&with_extra(&[("--aerodrome-pool", "0x123")])).unwrap_err();
+            assert!(err.contains("invalid --aerodrome-pool"), "{err}");
+        }
+
+        #[test]
+        fn zero_and_invalid_amounts_are_rejected() {
+            for zero in ["0", "000"] {
+                let err = parse_scan_arb_args(&replacing("--amount-in", zero)).unwrap_err();
+                assert!(err.contains("greater than zero"), "{zero}: {err}");
+            }
+            for bad in ["abc", "-5", "1.5", "1e18", "", "0x10"] {
+                let err = parse_scan_arb_args(&replacing("--amount-in", bad)).unwrap_err();
+                assert!(err.contains("invalid --amount-in"), "{bad}: {err}");
+            }
+        }
+
+        #[test]
+        fn invalid_block_is_rejected() {
+            for bad in ["abc", "-1", "1.5", "", "18446744073709551616"] {
+                let err = parse_scan_arb_args(&replacing("--block", bad)).unwrap_err();
+                assert!(err.contains("invalid --block"), "{bad}: {err}");
+            }
+        }
+
+        #[test]
+        fn negative_or_invalid_word_radius_is_rejected() {
+            let err = parse_scan_arb_args(&with_extra(&[("--word-radius", "-1")])).unwrap_err();
+            assert!(err.contains("non-negative"), "{err}");
+            let err = parse_scan_arb_args(&with_extra(&[("--word-radius", "x")])).unwrap_err();
+            assert!(err.contains("invalid --word-radius"), "{err}");
+        }
+
+        #[test]
+        fn unknown_and_dangling_arguments_are_rejected() {
+            let err = parse_scan_arb_args(&with_extra(&[("--wat", "1")])).unwrap_err();
+            assert!(err.contains("unrecognized argument"), "{err}");
+            for flag in [
+                "--aerodrome-pool",
+                "--uniswap-v3-pool",
+                "--block",
+                "--token-in",
+            ] {
+                let err = parse_scan_arb_args(&args(&[flag])).unwrap_err();
+                assert!(err.contains("requires a value"), "{flag}: {err}");
+            }
+        }
+
+        // ---- fixtures for loader / report tests ----
+
+        fn aero_state(
+            addr: &str,
+            t0: &str,
+            t1: &str,
+            fee: Option<u64>,
+            stable: bool,
+            block: u64,
+        ) -> PoolState {
+            let pool = Pool {
+                address: a(addr),
+                dex: DexKind::Aerodrome,
+                token0: Token {
+                    address: a(t0),
+                    symbol: "T0".into(),
+                    decimals: 18,
+                },
+                token1: Token {
+                    address: a(t1),
+                    symbol: "T1".into(),
+                    decimals: 6,
+                },
+                kind: PoolKind::Aerodrome {
+                    reserve0: U256::from_str_radix("3607642796485591444113", 10).unwrap(),
+                    reserve1: U256::from(9_965_914_277_780u64),
+                    stable,
+                    fee_bps: fee.map(U256::from),
+                },
+            };
+            PoolState::new(pool, block, None)
+        }
+
+        fn v3_read(addr: &str, t0: &str, t1: &str, block: u64) -> PinnedPoolRead {
+            let pool = Pool {
+                address: a(addr),
+                dex: DexKind::UniswapV3,
+                token0: Token {
+                    address: a(t0),
+                    symbol: "T0".into(),
+                    decimals: 18,
+                },
+                token1: Token {
+                    address: a(t1),
+                    symbol: "T1".into(),
+                    decimals: 6,
+                },
+                kind: PoolKind::ConcentratedLiquidity {
+                    fee_tier: 500,
+                    tick_spacing: 10,
+                    sqrt_price_x96: U256::from_str_radix("4166855781027983759429743", 10).unwrap(),
+                    current_tick: -197_069,
+                    liquidity: 2_241_227_707_498_366_949u128,
+                    initialized_ticks: Default::default(),
+                },
+            };
+            let mut ticks = BTreeMap::new();
+            ticks.insert(-197_070, -1_776_514_264_016_992i128);
+            PinnedPoolRead::UniswapV3(
+                PoolState::new(pool, block, None),
+                HydratedTicks::for_test(ticks, -199_680, -192_010),
+            )
+        }
+
+        fn good_aero(
+            addr: &str,
+            fee: Option<u64>,
+        ) -> (DexKind, Address, EngineResult<PinnedPoolRead>) {
+            (
+                DexKind::Aerodrome,
+                a(addr),
+                Ok(PinnedPoolRead::Aerodrome(aero_state(
+                    addr, WETH, USDC, fee, false, BLOCK,
+                ))),
+            )
+        }
+
+        fn good_v3(addr: &str) -> (DexKind, Address, EngineResult<PinnedPoolRead>) {
+            (
+                DexKind::UniswapV3,
+                a(addr),
+                Ok(v3_read(addr, WETH, USDC, BLOCK)),
+            )
+        }
+
+        fn header() -> ScanArbHeader {
+            ScanArbHeader {
+                chain_id: 8453,
+                block: BLOCK,
+                token_in: a(WETH),
+                amount_in: U256::from(1_000_000_000_000_000u64),
+                word_radius: 1,
+            }
+        }
+
+        fn detect(candidates: &[HistoricalQuoteInput]) -> EngineResult<Vec<RouteOutcome>> {
+            detect_cross_dex_opportunities_at_block(
+                BLOCK,
+                a(WETH),
+                U256::from(1_000_000_000_000_000u64),
+                candidates,
+            )
+        }
+
+        /// 2 Aerodrome (one with a real fee, one with an unhydrated fee that
+        /// produces real quote failures) + 2 V3, all WETH/USDC.
+        fn four_good_pools() -> Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> {
+            vec![
+                good_aero(AERO_1, Some(30)),
+                good_aero(AERO_2, None),
+                good_v3(V3_1),
+                good_v3(V3_2),
+            ]
+        }
+
+        // ---- loader isolation ----
+
+        #[test]
+        fn all_good_pools_load_in_supplied_order() {
+            let (loads, candidates) = build_scan_candidates(BLOCK, four_good_pools());
+            assert_eq!(loads.len(), 4);
+            assert_eq!(candidates.len(), 4);
+            let addrs: Vec<Address> = loads.iter().map(|l| l.address).collect();
+            assert_eq!(addrs, vec![a(AERO_1), a(AERO_2), a(V3_1), a(V3_2)]);
+            for load in &loads {
+                assert_eq!(load.result.as_ref().unwrap(), &(a(WETH), a(USDC)));
+            }
+            for c in &candidates {
+                assert_eq!(c.block(), BLOCK);
+            }
+        }
+
+        #[test]
+        fn one_pool_load_failure_does_not_suppress_other_pools_or_routes() {
+            let mut reads = four_good_pools();
+            // The first V3 pool's RPC read failed.
+            reads[2].2 = Err(EngineError::Dex {
+                dex: "uniswap_v3".into(),
+                reason: "slot0() at block 26000000 failed: simulated archive error".into(),
+            });
+            let (loads, candidates) = build_scan_candidates(BLOCK, reads);
+
+            assert_eq!(loads.len(), 4, "every pool must still have an outcome");
+            assert!(loads[0].result.is_ok());
+            assert!(loads[1].result.is_ok());
+            assert!(loads[2].result.is_err());
+            assert!(loads[3].result.is_ok());
+            assert_eq!(candidates.len(), 3);
+
+            // Remaining pools still form routes: (A1,V2) and (A2,V2),
+            // 2 WETH-start routes each.
+            let outcomes = detect(&candidates).unwrap();
+            assert_eq!(outcomes.len(), 4);
+            assert!(outcomes.iter().any(|o| o.opportunity().is_some()));
+
+            let report = format_scan_arb_report(&header(), &loads, &Ok(outcomes));
+            assert!(report.contains("uniswap_v3_pools_requested=2"));
+            assert!(report.contains("uniswap_v3_pools_loaded=1"));
+            assert!(report.contains("uniswap_v3_pools_failed=1"));
+            assert!(report.contains("simulated archive error"));
+        }
+
+        #[test]
+        fn validation_failures_are_isolated_per_pool() {
+            let reads: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> = vec![
+                good_aero(AERO_1, Some(30)),
+                // Stable-curve Aerodrome pool: rejected by M6A validation.
+                (
+                    DexKind::Aerodrome,
+                    a(AERO_2),
+                    Ok(PinnedPoolRead::Aerodrome(aero_state(
+                        AERO_2,
+                        WETH,
+                        USDC,
+                        Some(4),
+                        true,
+                        BLOCK,
+                    ))),
+                ),
+                good_v3(V3_1),
+                // V3 state pinned to a different block than requested.
+                (
+                    DexKind::UniswapV3,
+                    a(V3_2),
+                    Ok(v3_read(V3_2, WETH, USDC, BLOCK + 1)),
+                ),
+            ];
+            let (loads, candidates) = build_scan_candidates(BLOCK, reads);
+            assert!(loads[0].result.is_ok());
+            assert!(matches!(
+                loads[1].result.as_ref().unwrap_err(),
+                EngineError::NotImplemented(_)
+            ));
+            assert!(loads[2].result.is_ok());
+            assert!(matches!(
+                loads[3].result.as_ref().unwrap_err(),
+                EngineError::State(_)
+            ));
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(detect(&candidates).unwrap().len(), 2);
+        }
+
+        #[test]
+        fn unusable_token_pair_fails_that_pool_only() {
+            // Identical token0/token1 would otherwise make the detector's
+            // collection-level validation abort EVERY route.
+            let reads: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> = vec![
+                good_aero(AERO_1, Some(30)),
+                good_v3(V3_1),
+                (
+                    DexKind::UniswapV3,
+                    a(V3_2),
+                    Ok(v3_read(V3_2, WETH, WETH, BLOCK)),
+                ),
+            ];
+            let (loads, candidates) = build_scan_candidates(BLOCK, reads);
+            assert!(loads[2].result.is_err());
+            assert_eq!(candidates.len(), 2);
+            assert!(detect(&candidates).is_ok(), "detector must not abort");
+        }
+
+        #[test]
+        fn wrong_adapter_or_substituted_pool_is_rejected() {
+            let wrong_variant: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> = vec![(
+                DexKind::Aerodrome,
+                a(AERO_1),
+                Ok(v3_read(AERO_1, WETH, USDC, BLOCK)),
+            )];
+            let (loads, candidates) = build_scan_candidates(BLOCK, wrong_variant);
+            assert!(loads[0].result.is_err());
+            assert!(candidates.is_empty());
+
+            // Read returned a different pool address than requested.
+            let substituted: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> = vec![(
+                DexKind::Aerodrome,
+                a(AERO_1),
+                Ok(PinnedPoolRead::Aerodrome(aero_state(
+                    AERO_2,
+                    WETH,
+                    USDC,
+                    Some(30),
+                    false,
+                    BLOCK,
+                ))),
+            )];
+            let (loads, candidates) = build_scan_candidates(BLOCK, substituted);
+            assert!(matches!(
+                loads[0].result.as_ref().unwrap_err(),
+                EngineError::State(_)
+            ));
+            assert!(candidates.is_empty());
+        }
+
+        // ---- report ----
+
+        #[test]
+        fn report_is_deterministic_and_prints_every_pool_and_route() {
+            let (loads, candidates) = build_scan_candidates(BLOCK, four_good_pools());
+            let detection = detect(&candidates);
+            let r1 = format_scan_arb_report(&header(), &loads, &detection);
+            let r2 = format_scan_arb_report(&header(), &loads, &detection);
+            assert_eq!(r1, r2);
+
+            for needle in [
+                "chain_id=8453",
+                "block=26000000",
+                &format!("token_in={}", a(WETH)),
+                "amount_in_raw=1000000000000000",
+                "v3_word_radius=1",
+                "aerodrome_pools_requested=2",
+                "aerodrome_pools_loaded=2",
+                "aerodrome_pools_failed=0",
+                "uniswap_v3_pools_requested=2",
+                "uniswap_v3_pools_loaded=2",
+                "uniswap_v3_pools_failed=0",
+                "routes_evaluated=8",
+            ] {
+                assert!(r1.contains(needle), "missing {needle:?}\n{r1}");
+            }
+            for addr in [AERO_1, AERO_2, V3_1, V3_2] {
+                assert!(
+                    r1.contains(&format!("pool={}", a(addr))),
+                    "missing pool {addr}"
+                );
+            }
+            assert_eq!(r1.matches("load_status=LOADED").count(), 4);
+            for n in 1..=8 {
+                assert!(r1.contains(&format!("[route {n}]")), "missing route {n}");
+            }
+            assert!(!r1.contains("[route 9]"));
+        }
+
+        #[test]
+        fn report_prints_every_route_outcome_including_negative_profit_and_quote_failures() {
+            let (loads, candidates) = build_scan_candidates(BLOCK, four_good_pools());
+            let outcomes = detect(&candidates).unwrap();
+            let ok = outcomes
+                .iter()
+                .filter(|o| o.opportunity().is_some())
+                .count();
+            let failed = outcomes.len() - ok;
+            assert_eq!(
+                (ok, failed),
+                (4, 4),
+                "fixture: 4 real quotes, 4 unhydrated-fee failures"
+            );
+
+            let report =
+                format_scan_arb_report(&header(), &loads, &Ok(outcomes_clone(&candidates)));
+            assert_eq!(report.matches("status=OK").count(), ok);
+            assert_eq!(report.matches("status=FAILED kind=").count(), failed);
+            assert!(report.contains("error="));
+
+            let mut saw_negative = false;
+            for outcome in &detect(&candidates).unwrap() {
+                if let Some(opp) = outcome.opportunity() {
+                    let line = format!("gross_profit_raw={}", opp.gross_profit());
+                    assert!(report.contains(&line), "missing {line}");
+                    assert!(report.contains(&format!("final_amount_raw={}", opp.final_amount())));
+                    assert!(report.contains(&format!(
+                        "intermediate_amount_raw={}",
+                        opp.intermediate_amount()
+                    )));
+                    if opp.gross_profit().is_negative() {
+                        saw_negative = true;
+                    }
+                }
+            }
+            assert!(
+                saw_negative,
+                "a negative gross profit must be printed, not filtered"
+            );
+            assert!(report.contains(&format!("gross_profit_token={}", a(WETH))));
+            assert!(report.contains("start_token="));
+            assert!(report.contains("intermediate_token="));
+            assert!(report.contains("route_block=26000000"));
+            assert!(
+                report.contains("leg1=aerodrome pool=") || report.contains("leg1=uniswap_v3 pool=")
+            );
+        }
+
+        /// `RouteOutcome` is not `Clone`; re-run the (pure, deterministic)
+        /// detector to get a second independent copy.
+        fn outcomes_clone(candidates: &[HistoricalQuoteInput]) -> Vec<RouteOutcome> {
+            detect(candidates).unwrap()
+        }
+
+        #[test]
+        fn report_lists_failed_pool_with_address_dex_and_error() {
+            let mut reads = four_good_pools();
+            reads[0].2 = Err(EngineError::Dex {
+                dex: "aerodrome".into(),
+                reason: "getReserves() at block 26000000 failed: boom".into(),
+            });
+            let (loads, candidates) = build_scan_candidates(BLOCK, reads);
+            let report = format_scan_arb_report(&header(), &loads, &detect(&candidates));
+            assert!(report.contains("aerodrome_pools_failed=1"));
+            assert!(report.contains("load_status=FAILED"));
+            assert!(report.contains(&format!("pool={}", a(AERO_1))));
+            assert!(report.contains("getReserves() at block 26000000 failed: boom"));
+            // The failed pool's address appears in the pool section only.
+            assert!(!report.contains(&format!("leg1=aerodrome pool={}", a(AERO_1))));
+        }
+
+        #[test]
+        fn zero_routes_is_reported_without_fabricating_anything() {
+            // Pools load, but they share no token pair with each other.
+            let reads: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> = vec![
+                good_aero(AERO_1, Some(30)),
+                (
+                    DexKind::UniswapV3,
+                    a(V3_1),
+                    Ok(v3_read(V3_1, WETH, OTHER, BLOCK)),
+                ),
+            ];
+            let (loads, candidates) = build_scan_candidates(BLOCK, reads);
+            let report = format_scan_arb_report(&header(), &loads, &detect(&candidates));
+            assert!(report.contains("routes_evaluated=0"));
+            assert!(report.contains("zero routes were evaluated"));
+            assert!(!report.contains("[route 1]"));
+            assert!(!report.contains("status=OK"));
+            assert!(!report.contains("gross_profit_raw="));
+        }
+
+        #[test]
+        fn all_pools_failing_yields_zero_routes_and_reports_every_failure() {
+            let reads: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> = vec![
+                (
+                    DexKind::Aerodrome,
+                    a(AERO_1),
+                    Err(EngineError::Chain("down".into())),
+                ),
+                (
+                    DexKind::UniswapV3,
+                    a(V3_1),
+                    Err(EngineError::Chain("down".into())),
+                ),
+            ];
+            let (loads, candidates) = build_scan_candidates(BLOCK, reads);
+            assert!(candidates.is_empty());
+            let report = format_scan_arb_report(&header(), &loads, &detect(&candidates));
+            assert!(report.contains("aerodrome_pools_failed=1"));
+            assert!(report.contains("uniswap_v3_pools_failed=1"));
+            assert_eq!(report.matches("load_status=FAILED").count(), 2);
+            assert!(report.contains("routes_evaluated=0"));
+            assert!(!report.contains("status=OK"));
+        }
+
+        #[test]
+        fn detector_level_error_is_printed_not_hidden() {
+            let (loads, _) = build_scan_candidates(BLOCK, four_good_pools());
+            let detection: EngineResult<Vec<RouteOutcome>> = Err(EngineError::State(
+                "simulated collection-level failure".into(),
+            ));
+            let report = format_scan_arb_report(&header(), &loads, &detection);
+            assert!(report.contains("route_detection=FAILED"));
+            assert!(report.contains("simulated collection-level failure"));
+            assert_eq!(report.matches("load_status=LOADED").count(), 4);
+        }
+
+        #[test]
+        fn report_includes_all_required_disclaimers() {
+            let (loads, candidates) = build_scan_candidates(BLOCK, four_good_pools());
+            let report = format_scan_arb_report(&header(), &loads, &detect(&candidates));
+            for needle in [
+                "NOT net profit",
+                "No gas cost is subtracted.",
+                "No execution or settlement cost is subtracted.",
+                "historical research",
+                "not a live trading signal",
+                "No transaction is signed or submitted.",
+                "Only the pool addresses supplied by the operator were scanned",
+                "does not claim to scan all Base pools",
+            ] {
+                assert!(report.contains(needle), "missing {needle:?}");
+            }
         }
     }
 }
