@@ -1,16 +1,16 @@
-﻿# base-arb-engine
+# base-arb-engine
 
 A research/MVP Base L2 arbitrage engine. Eventual goal: detect executable
 price discrepancies between Aerodrome and Uniswap V3 on Base, size trades
 optimally, simulate locally, and execute atomically via flash-loan-funded
 Solidity executor. This repository is being built incrementally, day by day.
 
-## Current scope: Day 1 + Day 2 + Day 3 (M4-M8)
+## Current scope: Day 1 + Day 2 + Day 3 (M4-M9)
 
 Day 1 delivered the **market-data and state foundation**. Day 2 adds
 **automated pool discovery and real protocol market-state indexing** on top
-of it, still entirely over HTTP, still entirely read-only. Day 3 (M4-M8,
-documented in "Historical validation pipeline (M4-M8)" below) adds exact
+of it, still entirely over HTTP, still entirely read-only. Day 3 (M4-M9,
+documented in "Historical validation pipeline (M4-M9)" below) adds exact
 pricing math and a **read-only, historical** cross-DEX quote-evaluation
 pipeline. It is a research/validation tool: it produces raw gross quote
 differences at a pinned past block, not live or executable trading signals.
@@ -265,7 +265,7 @@ name/signature used to compute the filter is wrong; if they match but
 the problem instead. Also read-only: no private key, no signing, no state
 changes.
 
-## Historical validation pipeline (M4-M8)
+## Historical validation pipeline (M4-M9)
 
 Day 3 added exact pricing math and a read-only pipeline that evaluates
 cross-DEX round trips against **real pool state pinned to one historical
@@ -346,6 +346,44 @@ cargo run -- scan-arb \
   current tick (default 1); a swap that needs ticks beyond that range is
   reported as a quote failure, not guessed.
 
+## M9: historical discrete trade-size validation
+
+`scan-arb-sizes` reuses the M8 pool readers and detector. It loads all supplied
+pools once at one historical block, then evaluates every route at each
+operator-supplied input size and writes every successful or failed route
+outcome to a new CSV file.
+
+```powershell
+cargo run -- scan-arb-sizes --help
+cargo run -- scan-arb-sizes `
+  --aerodrome-pool 0xcDAC0d6c6C59727a65F871236188350531885C43 `
+  --uniswap-v3-pool 0xd0b53D9277642d899DF5C87A3966A349A798F224 `
+  --block 26000000 `
+  --token-in 0x4200000000000000000000000000000000000006 `
+  --size-in 100000000000000000 `
+  --size-in 250000000000000000 `
+  --size-in 500000000000000000 `
+  --size-in 1000000000000000000 `
+  --word-radius 5 `
+  --csv-out m9-size-sweep.csv
+```
+
+All sizes are raw integers in the starting token's smallest units. The sweep
+is discrete: it finds the best result among the sizes supplied, not a
+continuous/global optimum. V3 quote failures caused by insufficient hydrated
+tick coverage are retained in the report and CSV.
+
+An optional `--estimated-cost-raw <N>` applies one operator-supplied all-in
+cost to every route and every size, in the starting token's smallest units.
+When supplied, the report includes `estimated_net_profit_raw`; otherwise it
+reports only gross profit. This is **not** an on-chain gas estimate: the
+engine does not fetch gas prices, estimate route gas, convert ETH to the
+starting token, fetch token/USD prices, or model settlement costs. Choose a
+new `--csv-out` path for each run; existing files are never overwritten.
+
+M9 remains historical and read-only. It signs and submits no transactions
+and does not prove that a past quote can execute now.
+
 ## Test
 
 ```bash
@@ -369,7 +407,7 @@ cargo test --all-targets
 
 ## Not implemented yet
 
-- Optimal trade sizing
+- Continuous/analytic optimal sizing (M9 evaluates only a discrete set of operator-supplied sizes)
 - Aerodrome Slipstream pricing math and Aerodrome stable-curve pricing
   (Uniswap V3 swap simulation with tick-bitmap walking **is** implemented,
   as is Aerodrome volatile quoting - see M4 above)

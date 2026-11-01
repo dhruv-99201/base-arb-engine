@@ -1,4 +1,4 @@
-﻿mod arbitrage;
+mod arbitrage;
 mod chain;
 mod cli;
 mod config;
@@ -6,6 +6,7 @@ mod dex;
 mod discovery_pipeline;
 mod error;
 mod events;
+mod m9;
 mod market;
 mod pools;
 mod pricing;
@@ -32,7 +33,10 @@ async fn main() -> EngineResult<()> {
                 println!("{}", cli::DISCOVER_TEST_USAGE);
                 Ok(())
             }
-            Ok(cli::DiscoverTestCommand::Run { from_block, to_block }) => {
+            Ok(cli::DiscoverTestCommand::Run {
+                from_block,
+                to_block,
+            }) => {
                 let config = Config::load()?;
                 telemetry::init_tracing(&config.log_level);
                 cli::run_discover_test(&config, from_block, to_block).await
@@ -121,6 +125,24 @@ async fn main() -> EngineResult<()> {
         };
     }
 
+    if raw_args.len() > 1 && raw_args[1] == "scan-arb-sizes" {
+        return match m9::parse_m9_size_sweep_args(&raw_args[2..]) {
+            Ok(m9::M9SizeSweepCommand::Help) => {
+                println!("{}", m9::M9_SIZE_SWEEP_USAGE);
+                Ok(())
+            }
+            Ok(m9::M9SizeSweepCommand::Run(args)) => {
+                let config = Config::load()?;
+                telemetry::init_tracing(&config.log_level);
+                m9::run_m9_size_sweep(&config, args).await
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", m9::M9_SIZE_SWEEP_USAGE);
+                std::process::exit(2)
+            }
+        };
+    }
     if raw_args.len() > 1 && raw_args[1] == "scan-arb" {
         return match cli::parse_scan_arb_args(&raw_args[2..]) {
             Ok(cli::ScanArbCommand::Help) => {
@@ -239,7 +261,10 @@ async fn main() -> EngineResult<()> {
              WebSocket)."
         );
     } else {
-        tracing::info!(source = "websocket", "WebSocket endpoint configured - using streaming ingestion");
+        tracing::info!(
+            source = "websocket",
+            "WebSocket endpoint configured - using streaming ingestion"
+        );
     }
 
     // --- Block stream (WebSocket push, or HTTP-poll fallback - selected
@@ -335,7 +360,9 @@ async fn main() -> EngineResult<()> {
                 }
             }
         });
-    } else if chain_source.mode() == chain::ChainSourceMode::HttpPoll && !watched_addresses.is_empty() {
+    } else if chain_source.mode() == chain::ChainSourceMode::HttpPoll
+        && !watched_addresses.is_empty()
+    {
         tracing::warn!(
             source = "http_poll",
             "pool address(es) are configured but log/event ingestion is unavailable in HTTP \
