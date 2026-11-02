@@ -7,6 +7,7 @@ mod discovery_pipeline;
 mod error;
 mod events;
 mod m9;
+mod m10;
 mod market;
 mod pools;
 mod pricing;
@@ -125,6 +126,24 @@ async fn main() -> EngineResult<()> {
         };
     }
 
+    if raw_args.len() > 1 && raw_args[1] == "scan-arb-history" {
+        return match m10::parse_m10_history_args(&raw_args[2..]) {
+            Ok(m10::M10HistoryCommand::Help) => {
+                println!("{}", m10::M10_HISTORY_USAGE);
+                Ok(())
+            }
+            Ok(m10::M10HistoryCommand::Run(args)) => {
+                let config = Config::load()?;
+                telemetry::init_tracing(&config.log_level);
+                m10::run_m10_history(&config, args).await
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", m10::M10_HISTORY_USAGE);
+                std::process::exit(2)
+            }
+        };
+    }
     if raw_args.len() > 1 && raw_args[1] == "scan-arb-sizes" {
         return match m9::parse_m9_size_sweep_args(&raw_args[2..]) {
             Ok(m9::M9SizeSweepCommand::Help) => {

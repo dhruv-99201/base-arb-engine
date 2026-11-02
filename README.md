@@ -5,7 +5,7 @@ price discrepancies between Aerodrome and Uniswap V3 on Base, size trades
 optimally, simulate locally, and execute atomically via flash-loan-funded
 Solidity executor. This repository is being built incrementally, day by day.
 
-## Current scope: Day 1 + Day 2 + Day 3 (M4-M9)
+## Current scope: Day 1 + Day 2 + Day 3 (M4-M10)
 
 Day 1 delivered the **market-data and state foundation**. Day 2 adds
 **automated pool discovery and real protocol market-state indexing** on top
@@ -384,6 +384,43 @@ new `--csv-out` path for each run; existing files are never overwritten.
 M9 remains historical and read-only. It signs and submits no transactions
 and does not prove that a past quote can execute now.
 
+## M10: multi-block historical validation
+
+`scan-arb-history` extends the M9 size sweep across multiple independently
+pinned historical blocks. It reloads the supplied pools at each requested
+block, evaluates every requested size using the existing route detector, then
+merges all pool-load and route outcomes into one CSV and reports aggregate
+sample counts.
+
+```powershell
+cargo run -- scan-arb-history --help
+cargo run -- scan-arb-history `
+  --aerodrome-pool <AERODROME_POOL_ADDRESS> `
+  --uniswap-v3-pool <UNISWAP_V3_POOL_ADDRESS> `
+  --block <EARLIER_BLOCK> `
+  --block <LATER_BLOCK> `
+  --token-in <TOKEN_ADDRESS> `
+  --size-in <RAW_SIZE_1> `
+  --size-in <RAW_SIZE_2> `
+  --word-radius 5 `
+  --csv-out m10-history.csv
+```
+
+Supply 2..=100 distinct blocks and 2..=50 distinct sizes. Blocks are processed
+sequentially in the order supplied. Each block is an independent historical
+snapshot: pool state is not carried forward from one block to another. The
+CSV records pool-load success/failure rows, no-route samples, and every route
+quote outcome. The summary reports route quote success/failure counts,
+profitable gross quotes, and the proportion of requested blocks with at least
+one positive gross quote. When `--estimated-cost-raw` is supplied, it also
+counts positive net quotes using the same operator-supplied constant cost on
+every route, size, and block.
+
+M10 is a **sample comparison, not a stateful trading backtest**. It does not
+model capital, inventory, compounding, gas, USD conversion, transaction
+simulation, or execution. V3 tick hydration remains bounded by
+`--word-radius` independently at each block. The command remains read-only:
+it never signs or submits transactions.
 ## Test
 
 ```bash
