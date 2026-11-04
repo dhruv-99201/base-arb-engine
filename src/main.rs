@@ -6,8 +6,9 @@ mod dex;
 mod discovery_pipeline;
 mod error;
 mod events;
-mod m9;
 mod m10;
+mod m11;
+mod m9;
 mod market;
 mod pools;
 mod pricing;
@@ -126,6 +127,13 @@ async fn main() -> EngineResult<()> {
         };
     }
 
+    if raw_args.len() > 1 && raw_args[1] == "analyze-arb-history" {
+        if let Err(error) = m11::run_m11_cli(&raw_args[2..]) {
+            eprintln!("error: {error}\n{}", m11::M11_ANALYTICS_USAGE);
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     if raw_args.len() > 1 && raw_args[1] == "scan-arb-history" {
         return match m10::parse_m10_history_args(&raw_args[2..]) {
             Ok(m10::M10HistoryCommand::Help) => {

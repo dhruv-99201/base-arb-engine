@@ -411,8 +411,7 @@ sequentially in the order supplied. Each block is an independent historical
 snapshot: pool state is not carried forward from one block to another. The
 CSV records pool-load success/failure rows, no-route samples, and every route
 quote outcome. The summary reports route quote success/failure counts,
-profitable gross quotes, and the proportion of requested blocks with at least
-one positive gross quote. When `--estimated-cost-raw` is supplied, it also
+profitable gross quotes, and the proportion of blocks with successful route quotes that had at least one positive gross quote. When `--estimated-cost-raw` is supplied, it also
 counts positive net quotes using the same operator-supplied constant cost on
 every route, size, and block.
 
@@ -421,6 +420,33 @@ model capital, inventory, compounding, gas, USD conversion, transaction
 simulation, or execution. V3 tick hydration remains bounded by
 `--word-radius` independently at each block. The command remains read-only:
 it never signs or submits transactions.
+## M11: offline historical sweep analytics
+
+`analyze-arb-history` reads an existing M10 CSV. It does not connect to an RPC
+provider or modify the source CSV. It validates the M10 columns and analyzes
+successful (`OK`) route rows, grouping them by trade size and ordered DEX route.
+Pool-load rows, no-route samples, and failed route rows are counted separately
+and are never treated as zero-profit quotes.
+
+```powershell
+cargo run -- analyze-arb-history --help
+cargo run -- analyze-arb-history `
+  --input m10-history.csv `
+  --summary-csv m11-summary.csv `
+  --report-out m11-report.txt
+```
+
+The summary includes quote counts, positive-quote counts, gross-profit totals,
+mean/best/worst gross profit, return statistics in fixed-point basis points,
+and a block hit rate whose denominator contains only blocks with successful quotes for that size and route direction. Net profitability is not inferred:
+M10's optional operator cost is not a verified gas model. Existing output
+files are never overwritten. M11 v1 parses trade sizes and gross-profit
+values as signed 128-bit integers and block numbers as unsigned 64-bit
+integers, rejecting values outside those ranges.
+
+M11 is descriptive analysis of independent M10 snapshots, not a stateful
+backtest. It does not model capital, inventory, compounding, execution,
+transaction costs, or live trading.
 ## Test
 
 ```bash
