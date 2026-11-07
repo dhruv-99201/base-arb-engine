@@ -8,6 +8,7 @@ mod error;
 mod events;
 mod m10;
 mod m11;
+mod m12;
 mod m9;
 mod market;
 mod pools;
@@ -25,10 +26,36 @@ use futures::StreamExt;
 
 #[tokio::main]
 async fn main() -> EngineResult<()> {
-    // --- discover-test / inspect-tx subcommands: read-only diagnostics,
-    // handled before the normal startup path so `--help` never requires a
-    // valid .env and argument errors never touch the network. ---
+    // --- Read-only CLI subcommands ---
+    // These are handled before normal startup so --help does not require
+    // a valid .env file, and invalid arguments do not touch the network.
     let raw_args: Vec<String> = std::env::args().collect();
+
+    // M12: discover historical WETH/USDC pool catalog.
+    if raw_args.len() > 1 && raw_args[1] == "discover-pool-catalog" {
+        return match m12::parse_m12_catalog_args(&raw_args[2..]) {
+            Ok(m12::M12CatalogCommand::Help) => {
+                println!("{}", m12::M12_CATALOG_USAGE);
+                Ok(())
+            }
+            Ok(m12::M12CatalogCommand::Run {
+                from_block,
+                to_block,
+                csv_out,
+            }) => {
+                let config = Config::load()?;
+                telemetry::init_tracing(&config.log_level);
+                m12::run_m12_catalog(&config, from_block, to_block, csv_out).await
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", m12::M12_CATALOG_USAGE);
+                std::process::exit(2)
+            }
+        };
+    }
+
+    // Existing read-only discovery diagnostic.
     if raw_args.len() > 1 && raw_args[1] == "discover-test" {
         return match cli::parse_discover_test_args(&raw_args[2..]) {
             Ok(cli::DiscoverTestCommand::Help) => {
@@ -50,6 +77,8 @@ async fn main() -> EngineResult<()> {
             }
         };
     }
+
+    // Existing transaction inspection diagnostic.
     if raw_args.len() > 1 && raw_args[1] == "inspect-tx" {
         return match cli::parse_inspect_tx_args(&raw_args[2..]) {
             Ok(cli::InspectTxCommand::Help) => {

@@ -128,6 +128,35 @@ impl HttpLogPoller {
         }
         Ok(all_logs)
     }
+    /// Strict historical fetch for factory events with indexed token filters.
+    ///
+    /// Unlike fetch_logs(), this method never silently accepts a failed
+    /// block range. It returns an error if any sub-range remains unavailable
+    /// after retry and subdivision.
+    pub async fn fetch_logs_strict_indexed_pair(
+        &self,
+        from: u64,
+        to: u64,
+        addresses: Vec<Address>,
+        topic0: B256,
+        token0: Address,
+        token1: Address,
+        topic3: Option<bool>,
+    ) -> EngineResult<Vec<RpcLog>> {
+        let mut all_logs = Vec::new();
+
+        for (chunk_from, chunk_to) in compute_chunks(from, to, self.max_block_range) {
+            let mut logs = self
+                .fetch_range_with_retry_strict(
+                    chunk_from, chunk_to, &addresses, topic0, token0, token1, topic3, 0,
+                )
+                .await?;
+
+            all_logs.append(&mut logs);
+        }
+
+        Ok(all_logs)
+    }
 
     /// Recursive helper: try `[from, to]`; on failure, halve and retry each
     /// half, up to `MAX_RANGE_REDUCTIONS` deep. Returns whatever logs were
@@ -200,6 +229,83 @@ impl HttpLogPoller {
             }
         })
     }
+    /// Strict retry implementation. Splits failing ranges like the normal
+    /// fetcher, but propagates an error if any final range remains unavailable.
+    fn fetch_range_with_retry_strict<'a>(
+        &'a self,
+        from: u64,
+        to: u64,
+        addresses: &'a [Address],
+        topic0: B256,
+        token0: Address,
+        token1: Address,
+        topic3: Option<bool>,
+        depth: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = EngineResult<Vec<RpcLog>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self
+                .fetch_range_strict(from, to, addresses, topic0, token0, token1, topic3)
+                .await
+            {
+                Ok(logs) => Ok(logs),
+
+                Err(error) => {
+                    tracing::warn!(
+                        source = "http_poll",
+                        from_block = from,
+                        to_block = to,
+                        error = %error,
+                        "strict eth_getLogs range failed; attempting subdivision"
+                    );
+
+                    if depth >= MAX_RANGE_REDUCTIONS {
+                        return Err(EngineError::Chain(format!(
+                            "strict eth_getLogs failed for block range [{from}, {to}] \
+                             after {depth} reductions: {error}"
+                        )));
+                    }
+
+                    match reduce_range_on_failure(from, to) {
+                        Some((reduced_from, reduced_to)) => {
+                            let mut logs = self
+                                .fetch_range_with_retry_strict(
+                                    reduced_from,
+                                    reduced_to,
+                                    addresses,
+                                    topic0,
+                                    token0,
+                                    token1,
+                                    topic3,
+                                    depth + 1,
+                                )
+                                .await?;
+
+                            let mut rest = self
+                                .fetch_range_with_retry_strict(
+                                    reduced_to + 1,
+                                    to,
+                                    addresses,
+                                    topic0,
+                                    token0,
+                                    token1,
+                                    topic3,
+                                    depth + 1,
+                                )
+                                .await?;
+
+                            logs.append(&mut rest);
+                            Ok(logs)
+                        }
+
+                        None => Err(EngineError::Chain(format!(
+                            "strict eth_getLogs failed for single block {from}: {error}"
+                        ))),
+                    }
+                }
+            }
+        })
+    }
 
     async fn fetch_range(
         &self,
@@ -224,6 +330,42 @@ impl HttpLogPoller {
             .get_logs(&filter)
             .await
             .map_err(|e| EngineError::Chain(format!("get_logs failed: {e}")))
+    }
+    /// Perform one strict indexed-pair RPC query.
+    async fn fetch_range_strict(
+        &self,
+        from: u64,
+        to: u64,
+        addresses: &[Address],
+        topic0: B256,
+        token0: Address,
+        token1: Address,
+        topic3: Option<bool>,
+    ) -> EngineResult<Vec<RpcLog>> {
+        let url = self
+            .rpc_url
+            .parse()
+            .map_err(|e| EngineError::Chain(format!("invalid BASE_RPC_URL: {e}")))?;
+
+        let provider = ProviderBuilder::new().connect_http(url);
+
+        let mut filter = Filter::new().from_block(from).to_block(to);
+
+        if !addresses.is_empty() {
+            filter = filter.address(addresses.to_vec());
+        }
+
+        filter = filter.event_signature(topic0).topic1(token0).topic2(token1);
+
+        if let Some(value) = topic3 {
+            filter = filter.topic3(value);
+        }
+
+        provider.get_logs(&filter).await.map_err(|e| {
+            EngineError::Chain(format!(
+                "strict get_logs failed for blocks [{from}, {to}]: {e}"
+            ))
+        })
     }
 }
 
@@ -299,5 +441,49 @@ mod tests {
 
         // A single block that still fails cannot be reduced further.
         assert_eq!(reduce_range_on_failure(cur.0, cur.0), None);
+    }
+    #[tokio::test]
+    async fn strict_fetch_empty_range_returns_empty_without_rpc() {
+        let poller = HttpLogPoller::new("not a valid URL".to_string(), 100);
+
+        let logs = poller
+            .fetch_logs_strict_indexed_pair(
+                200,
+                199,
+                Vec::new(),
+                B256::ZERO,
+                Address::ZERO,
+                Address::ZERO,
+                Some(false),
+            )
+            .await
+            .expect("an empty range should not require an RPC connection");
+
+        assert!(logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn strict_fetch_propagates_single_block_failure() {
+        let poller = HttpLogPoller::new("not a valid URL".to_string(), 100);
+
+        let error = poller
+            .fetch_logs_strict_indexed_pair(
+                123,
+                123,
+                Vec::new(),
+                B256::ZERO,
+                Address::ZERO,
+                Address::ZERO,
+                Some(false),
+            )
+            .await
+            .expect_err("a failed strict fetch must return an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("strict eth_getLogs failed for single block 123"),
+            "unexpected error: {error}"
+        );
     }
 }
