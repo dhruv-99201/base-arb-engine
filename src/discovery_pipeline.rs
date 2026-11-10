@@ -1,4 +1,4 @@
-﻿//! Orchestrates Day 2's HTTP-only pipeline: scan factories for newly
+//! Orchestrates Day 2's HTTP-only pipeline: scan factories for newly
 //! created pools, hydrate them (token metadata + on-chain state), then scan
 //! already-known pools for swap events and fold them into `MarketState`.
 //!
@@ -50,6 +50,7 @@ impl DiscoveryPipeline {
                 config.aerodrome_factory_address,
             )),
         ];
+
         if config.aerodrome_slipstream_factory_addresses.is_empty() {
             tracing::info!(
                 "AERODROME_SLIPSTREAM_FACTORY_ADDRESSES is empty - Slipstream pool discovery \
@@ -126,10 +127,11 @@ impl DiscoveryPipeline {
                     tracing::error!(
                         source = "http_poll",
                         scan = "discovery",
+                        dex = self.discovery_adapters[i].dex().name(),
                         error = %err,
-                        "discovery scan failed for this factory"
+                        "discovery scan failed; checkpoint retained and scan will retry"
                     );
-                    continue;
+                    return;
                 }
             };
 
@@ -142,11 +144,10 @@ impl DiscoveryPipeline {
             );
 
             for log in &logs {
-                // Defensive reorg guard - see module/README notes: this
-                // skips a retracted log rather than applying it as a real
-                // discovery event. It does NOT retroactively undo any state
-                // from a previous poll; full reorg reconciliation is not
-                // implemented.
+                // Defensive reorg guard. This skips a retracted log rather
+                // than applying it as a real discovery event. It does NOT
+                // retroactively undo state from a previous poll; full reorg
+                // reconciliation is not implemented.
                 if log.removed {
                     tracing::warn!(
                         source = "http_poll",
@@ -158,7 +159,11 @@ impl DiscoveryPipeline {
                 let discovered = match self.discovery_adapters[i].decode_pool_created(log) {
                     Ok(d) => d,
                     Err(err) => {
-                        tracing::error!(source = "http_poll", error = %err, "failed to decode PoolCreated log, skipping");
+                        tracing::error!(
+                            source = "http_poll",
+                            error = %err,
+                            "failed to decode PoolCreated log, skipping"
+                        );
                         continue;
                     }
                 };
@@ -204,6 +209,7 @@ impl DiscoveryPipeline {
             }
         }
 
+        // Advance only after every configured factory query succeeded.
         self.discovery_checkpoint.advance(to);
     }
 
@@ -231,6 +237,7 @@ impl DiscoveryPipeline {
                 .token_cache
                 .get_or_fetch(&self.rpc_url, token0_addr)
                 .await;
+
             let token1 = self
                 .token_cache
                 .get_or_fetch(&self.rpc_url, token1_addr)
@@ -262,7 +269,7 @@ impl DiscoveryPipeline {
                     reserve0: U256::ZERO,
                     reserve1: U256::ZERO,
                     stable: false,
-                    fee_bps: None, // not yet hydrated - see PoolKind::Aerodrome::fee_bps docs
+                    fee_bps: None,
                 });
 
             let skeleton = Pool {
@@ -277,11 +284,12 @@ impl DiscoveryPipeline {
                 Ok(pool_state) => {
                     if let Some(record) = self.registry.get_mut(&address) {
                         let liquidity_available = has_liquidity(&pool_state.pool.kind);
+
                         record.pool = pool_state.pool;
                         record.status = PoolStatus::Active;
                         record.last_updated_block = pool_state.freshness.last_updated_block;
-                        record.last_updated_timestamp =
-                            pool_state.freshness.last_updated_timestamp;
+                        record.last_updated_timestamp = pool_state.freshness.last_updated_timestamp;
+
                         record.eligibility = PoolEligibility {
                             verified_protocol: true,
                             token_metadata_available: true,
@@ -289,6 +297,7 @@ impl DiscoveryPipeline {
                             liquidity_available,
                             state_readable: true,
                         };
+
                         tracing::info!(
                             source = "http_poll",
                             event = "pool_hydrated",
@@ -299,8 +308,14 @@ impl DiscoveryPipeline {
                         );
                     }
                 }
+
                 Err(err) => {
-                    tracing::warn!(source = "http_poll", pool = %address, error = %err, "state hydration failed - marking pool inactive");
+                    tracing::warn!(
+                        source = "http_poll",
+                        pool = %address,
+                        error = %err,
+                        "state hydration failed - marking pool inactive"
+                    );
                     self.registry.set_status(&address, PoolStatus::Inactive);
                 }
             }
@@ -317,11 +332,13 @@ impl DiscoveryPipeline {
 
         let active_by_dex: HashMap<DexKind, Vec<Address>> = {
             let mut map: HashMap<DexKind, Vec<Address>> = HashMap::new();
+
             for (addr, record) in self.registry.iter() {
                 if record.status == PoolStatus::Active {
                     map.entry(record.pool.dex).or_default().push(*addr);
                 }
             }
+
             map
         };
 
@@ -357,9 +374,9 @@ impl DiscoveryPipeline {
                         scan = "swaps",
                         dex = dex.name(),
                         error = %err,
-                        "swap scan failed"
+                        "swap scan failed; checkpoint retained and scan will retry"
                     );
-                    continue;
+                    return;
                 }
             };
 
@@ -385,22 +402,33 @@ impl DiscoveryPipeline {
                 }
 
                 let received_at_us = now_us();
+
                 match adapter.decode_event(log, self.chain_id, received_at_us) {
                     Ok(event) => {
                         let mut guard = market_state.write().await;
+
                         if guard.apply_event(event.clone()) {
                             crate::telemetry::log_event_received(&event);
                         } else {
                             crate::telemetry::log_event_duplicate(&event);
                         }
                     }
+
                     Err(err) => {
-                        tracing::error!(source = "http_poll", error = %err, "failed to decode swap log, skipping");
+                        tracing::error!(
+                            source = "http_poll",
+                            scan = "swaps",
+                            dex = dex.name(),
+                            error = %err,
+                            "failed to decode swap log, skipping"
+                        );
+                        continue;
                     }
                 }
             }
         }
 
+        // Advance only after every active DEX query succeeded.
         self.swap_checkpoint.advance(to);
     }
 }
@@ -411,8 +439,9 @@ fn placeholder_pool_kind(params: &DiscoveryParams) -> PoolKind {
             reserve0: U256::ZERO,
             reserve1: U256::ZERO,
             stable: *stable,
-            fee_bps: None, // not yet hydrated - see PoolKind::Aerodrome::fee_bps docs
+            fee_bps: None,
         },
+
         DiscoveryParams::ConcentratedLiquidity { tick_spacing, .. } => {
             PoolKind::ConcentratedLiquidity {
                 fee_tier: 0,
@@ -431,6 +460,7 @@ fn has_liquidity(kind: &PoolKind) -> bool {
         PoolKind::Aerodrome {
             reserve0, reserve1, ..
         } => !reserve0.is_zero() && !reserve1.is_zero(),
+
         PoolKind::ConcentratedLiquidity { liquidity, .. } => *liquidity > 0,
     }
 }

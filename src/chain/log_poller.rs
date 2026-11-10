@@ -13,9 +13,9 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log as RpcLog};
 
-/// How many times a failing range is allowed to be halved before giving up
-/// on that sub-range entirely (logged, not fatal - see `fetch_range`).
-const MAX_RANGE_REDUCTIONS: u32 = 5;
+/// Maximum recursive subdivisions for a failing block range.
+/// If a range still fails at the limit, the fetch returns an error.
+const MAX_RANGE_REDUCTIONS: u32 = 64;
 
 /// Tracks how far a given scan (discovery or swaps) has progressed, so
 /// polling cycles never redundantly rescan already-processed blocks and
@@ -106,12 +106,12 @@ impl HttpLogPoller {
         }
     }
 
-    /// Fetch all logs in `[from, to]` matching `addresses`/`topic0`,
-    /// chunking the range and transparently shrinking any chunk that the
-    /// provider rejects (e.g. "range too large") until it succeeds or can't
-    /// be shrunk further. Never panics or aborts the whole scan because one
-    /// sub-range is troublesome - a failed leaf range is logged and
-    /// skipped, not silently dropped without a trace.
+    /// Fetch all logs in `[from, to]` matching `addresses`/`topic0`.
+    ///
+    /// The range is chunked according to the configured provider limit.
+    /// Failed ranges are recursively subdivided. This method is strict:
+    /// it returns an error if any final sub-range remains unavailable.
+    /// Partial results are never reported as a complete scan.
     pub async fn fetch_logs(
         &self,
         from: u64,
@@ -120,12 +120,15 @@ impl HttpLogPoller {
         topic0: B256,
     ) -> EngineResult<Vec<RpcLog>> {
         let mut all_logs = Vec::new();
+
         for (chunk_from, chunk_to) in compute_chunks(from, to, self.max_block_range) {
             let mut logs = self
                 .fetch_range_with_retry(chunk_from, chunk_to, &addresses, topic0, 0)
-                .await;
+                .await?;
+
             all_logs.append(&mut logs);
         }
+
         Ok(all_logs)
     }
     /// Strict historical fetch for factory events with indexed token filters.
@@ -158,11 +161,9 @@ impl HttpLogPoller {
         Ok(all_logs)
     }
 
-    /// Recursive helper: try `[from, to]`; on failure, halve and retry each
-    /// half, up to `MAX_RANGE_REDUCTIONS` deep. Returns whatever logs were
-    /// successfully collected - partial results on partial failure, not an
-    /// all-or-nothing error, since one bad sub-range shouldn't discard logs
-    /// we already successfully fetched from the rest of the range.
+    /// Recursive strict fetcher. Splits failing ranges and returns an error
+    /// if any final range remains unavailable. Never returns partial results
+    /// as though the complete range had been fetched.
     fn fetch_range_with_retry<'a>(
         &'a self,
         from: u64,
@@ -170,27 +171,26 @@ impl HttpLogPoller {
         addresses: &'a [Address],
         topic0: B256,
         depth: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RpcLog>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = EngineResult<Vec<RpcLog>>> + Send + 'a>>
+    {
         Box::pin(async move {
             match self.fetch_range(from, to, addresses, topic0).await {
-                Ok(logs) => logs,
-                Err(err) => {
+                Ok(logs) => Ok(logs),
+
+                Err(error) => {
                     tracing::warn!(
                         source = "http_poll",
                         from_block = from,
                         to_block = to,
-                        error = %err,
-                        "eth_getLogs failed for range"
+                        error = %error,
+                        "eth_getLogs failed; attempting range subdivision"
                     );
 
                     if depth >= MAX_RANGE_REDUCTIONS {
-                        tracing::error!(
-                            source = "http_poll",
-                            from_block = from,
-                            to_block = to,
-                            "giving up on range after max reductions - these blocks will be skipped"
-                        );
-                        return Vec::new();
+                        return Err(EngineError::Chain(format!(
+                            "eth_getLogs failed for block range [{from}, {to}] \
+                             after {depth} reductions: {error}"
+                        )));
                     }
 
                     match reduce_range_on_failure(from, to) {
@@ -203,7 +203,8 @@ impl HttpLogPoller {
                                     topic0,
                                     depth + 1,
                                 )
-                                .await;
+                                .await?;
+
                             let mut rest = self
                                 .fetch_range_with_retry(
                                     reduced_to + 1,
@@ -212,18 +213,15 @@ impl HttpLogPoller {
                                     topic0,
                                     depth + 1,
                                 )
-                                .await;
+                                .await?;
+
                             logs.append(&mut rest);
-                            logs
+                            Ok(logs)
                         }
-                        None => {
-                            tracing::error!(
-                                source = "http_poll",
-                                block = from,
-                                "single block still fails eth_getLogs - skipping"
-                            );
-                            Vec::new()
-                        }
+
+                        None => Err(EngineError::Chain(format!(
+                            "eth_getLogs failed for single block {from}: {error}"
+                        ))),
                     }
                 }
             }
@@ -483,6 +481,34 @@ mod tests {
             error
                 .to_string()
                 .contains("strict eth_getLogs failed for single block 123"),
+            "unexpected error: {error}"
+        );
+    }
+    #[tokio::test]
+    async fn generic_fetch_empty_range_returns_empty_without_rpc() {
+        let poller = HttpLogPoller::new("not a valid URL".to_string(), 100);
+
+        let logs = poller
+            .fetch_logs(200, 199, Vec::new(), B256::ZERO)
+            .await
+            .expect("an empty range should not require an RPC connection");
+
+        assert!(logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generic_fetch_propagates_single_block_failure() {
+        let poller = HttpLogPoller::new("not a valid URL".to_string(), 100);
+
+        let error = poller
+            .fetch_logs(123, 123, Vec::new(), B256::ZERO)
+            .await
+            .expect_err("a failed generic fetch must return an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("eth_getLogs failed for single block 123"),
             "unexpected error: {error}"
         );
     }
