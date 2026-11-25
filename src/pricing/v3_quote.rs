@@ -17,7 +17,7 @@
 //! hydrated (`hydrated_tick_lo`/`hydrated_tick_hi`, from real `tickBitmap()`
 //! word reads - see [`HydratedTicks`], never guessed or defaulted to "the
 //! whole range"). If the swap would need to search past that boundary,
-//! [`quote_exact_input`] returns `EngineError::NotImplemented` rather than
+//! [`quote_exact_input`] returns `EngineError::InsufficientV3TickCoverage` rather than
 //! silently treating unhydrated ticks as uninitialized.
 //!
 //! **Coupling safety (C1/C2 fix).** `HydratedTicks` bundles
@@ -64,7 +64,9 @@ use crate::error::{EngineError, EngineResult};
 use crate::market::models::{PoolKind, PoolState};
 use crate::pricing::swap_math::compute_swap_step;
 use crate::pricing::tick_bitmap::next_initialized_tick_within_one_word;
-use crate::pricing::tick_math::{get_sqrt_ratio_at_tick, get_tick_at_sqrt_ratio, MAX_TICK, MIN_TICK};
+use crate::pricing::tick_math::{
+    get_sqrt_ratio_at_tick, get_tick_at_sqrt_ratio, MAX_TICK, MIN_TICK,
+};
 use alloy::primitives::{I256, U256};
 use std::collections::BTreeMap;
 
@@ -396,13 +398,14 @@ pub fn quote_exact_input(
         // trusted - "uninitialized" might only mean "we never read that
         // word's bitmap", not "the real pool has no liquidity change
         // there". See module docs.
-        if next_tick_raw < state.hydrated.hydrated_tick_lo || next_tick_raw > state.hydrated.hydrated_tick_hi {
-            return Err(EngineError::NotImplemented(format!(
-                "quote_exact_input: swap requires tick data at/beyond {next_tick_raw}, outside \
-                 the confirmed-hydrated range [{}, {}] - refusing to fabricate a price past real \
-                 hydrated state",
-                state.hydrated.hydrated_tick_lo, state.hydrated.hydrated_tick_hi
-            )));
+        if next_tick_raw < state.hydrated.hydrated_tick_lo
+            || next_tick_raw > state.hydrated.hydrated_tick_hi
+        {
+            return Err(EngineError::InsufficientV3TickCoverage {
+                required_tick: next_tick_raw,
+                hydrated_tick_lo: state.hydrated.hydrated_tick_lo,
+                hydrated_tick_hi: state.hydrated.hydrated_tick_hi,
+            });
         }
 
         // Explicit GLOBAL tick-range termination: the raw search result
@@ -446,12 +449,20 @@ pub fn quote_exact_input(
         if sqrt_price == sqrt_price_target {
             // Reached (or crossed) next_tick.
             if initialized {
-                let liquidity_net = *state.hydrated.initialized_ticks.get(&next_tick).unwrap_or(&0);
+                let liquidity_net = *state
+                    .hydrated
+                    .initialized_ticks
+                    .get(&next_tick)
+                    .unwrap_or(&0);
                 // Crossing downward (zero_for_one) applies the negated
                 // liquidityNet - same sign convention as real V3: a tick's
                 // liquidityNet is defined for crossing it left-to-right
                 // (upward).
-                let signed_delta = if zero_for_one { -liquidity_net } else { liquidity_net };
+                let signed_delta = if zero_for_one {
+                    -liquidity_net
+                } else {
+                    liquidity_net
+                };
                 liquidity = add_liquidity_delta(liquidity, signed_delta)?;
                 crossings += 1;
             }
@@ -503,7 +514,14 @@ mod tests {
         fee_pips: u32,
         hydrated: &'a HydratedTicks,
     ) -> EngineResult<HydratedV3State<'a>> {
-        HydratedV3State::new(sqrt_price_x96, current_tick, liquidity, tick_spacing, fee_pips, hydrated)
+        HydratedV3State::new(
+            sqrt_price_x96,
+            current_tick,
+            liquidity,
+            tick_spacing,
+            fee_pips,
+            hydrated,
+        )
     }
 
     // --- HydratedTicks read-only accessor regression tests ---
@@ -589,8 +607,8 @@ mod tests {
         let liquidity = 110_000_000_000_000_000_000_000u128; // base(1e22) + L(1e23)
         let s = state(sqrt_30, 30, liquidity, 60, 3000, &hydrated).unwrap();
 
-        let result = quote_exact_input(&s, U256::from(5_000_000_000_000_000_000_000u128), true)
-            .unwrap();
+        let result =
+            quote_exact_input(&s, U256::from(5_000_000_000_000_000_000_000u128), true).unwrap();
 
         assert_eq!(result.ticks_crossed, 1, "must cross exactly the -60 tick");
         assert_eq!(
@@ -626,8 +644,8 @@ mod tests {
         let liquidity = 110_000_000_000_000_000_000_000u128;
         let s = state(sqrt_neg30, -30, liquidity, 60, 3000, &hydrated).unwrap();
 
-        let result = quote_exact_input(&s, U256::from(5_000_000_000_000_000_000_000u128), false)
-            .unwrap();
+        let result =
+            quote_exact_input(&s, U256::from(5_000_000_000_000_000_000_000u128), false).unwrap();
 
         assert_eq!(result.ticks_crossed, 1, "must cross exactly the +60 tick");
         assert_eq!(
@@ -666,10 +684,19 @@ mod tests {
 
         let err = quote_exact_input(&s, U256::from(5_000_000_000_000_000_000_000u128), true)
             .expect_err("must reject rather than fabricate a price past hydrated data");
-        assert!(
-            matches!(err, EngineError::NotImplemented(_)),
-            "expected NotImplemented (incomplete state), got {err:?}"
-        );
+        match err {
+            EngineError::InsufficientV3TickCoverage {
+                required_tick,
+                hydrated_tick_lo,
+                hydrated_tick_hi,
+            } => {
+                assert!(
+                    required_tick < hydrated_tick_lo || required_tick > hydrated_tick_hi,
+                    "required tick {required_tick} should be outside [{hydrated_tick_lo}, {hydrated_tick_hi}]"
+                );
+            }
+            other => panic!("expected typed InsufficientV3TickCoverage, got {other:?}"),
+        }
     }
 
     /// This rejection now happens at `HydratedV3State::new` construction
@@ -748,7 +775,10 @@ mod tests {
         for amt in [1_000u64, 1_000_000, 1_000_000_000, 1_000_000_000_000] {
             let s = state(sqrt_100, 100, 10u128.pow(24), 60, 3000, &hydrated).unwrap();
             let result = quote_exact_input(&s, U256::from(amt), true).unwrap();
-            assert!(result.amount_out > prev, "output must strictly increase with input");
+            assert!(
+                result.amount_out > prev,
+                "output must strictly increase with input"
+            );
             prev = result.amount_out;
         }
     }
@@ -1098,8 +1128,8 @@ mod tests {
         );
 
         let s = HydratedV3State::from_pool_state(&pool_state, &hydrated).unwrap();
-        let result = quote_exact_input(&s, U256::from(5_000_000_000_000_000_000_000u128), true)
-            .unwrap();
+        let result =
+            quote_exact_input(&s, U256::from(5_000_000_000_000_000_000_000u128), true).unwrap();
 
         assert_eq!(result.ticks_crossed, 1, "must cross exactly the -60 tick");
         assert_eq!(
@@ -1190,8 +1220,7 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            quote_exact_input(&s, U256::from(4_000_000_000_000_000_000u64), true).unwrap();
+        let result = quote_exact_input(&s, U256::from(4_000_000_000_000_000_000u64), true).unwrap();
 
         assert_eq!(result.amount_out, U256::from(11_057_573_092u64));
         assert_eq!(

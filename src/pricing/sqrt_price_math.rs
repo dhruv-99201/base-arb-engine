@@ -1,4 +1,4 @@
-﻿//! Sqrt-price math: `get_amount_0_delta`/`get_amount_1_delta` and the
+//! Sqrt-price math: `get_amount_0_delta`/`get_amount_1_delta` and the
 //! `get_next_sqrt_price_from_*` helpers `swap_math::compute_swap_step`
 //! needs. Port of Uniswap V3's `SqrtPriceMath.sol`.
 //!
@@ -27,7 +27,9 @@ fn u160_max() -> U256 {
 /// Integer division rounding up.
 pub(crate) fn div_rounding_up(a: U256, b: U256) -> EngineResult<U256> {
     if b.is_zero() {
-        return Err(EngineError::Arithmetic("div_rounding_up: division by zero".into()));
+        return Err(EngineError::Arithmetic(
+            "div_rounding_up: division by zero".into(),
+        ));
     }
     let q = a / b;
     let r = a % b;
@@ -115,9 +117,9 @@ fn get_next_sqrt_price_from_amount_0_rounding_up(
             .ok_or_else(|| EngineError::Arithmetic("get_next_sqrt_price: overflow".into()))?;
         div_rounding_up(numerator_1, term)
     } else {
-        let product = amount
-            .checked_mul(sqrt_p_x96)
-            .ok_or_else(|| EngineError::Arithmetic("get_next_sqrt_price: price underflow".into()))?;
+        let product = amount.checked_mul(sqrt_p_x96).ok_or_else(|| {
+            EngineError::Arithmetic("get_next_sqrt_price: price underflow".into())
+        })?;
         if numerator_1 <= product {
             return Err(EngineError::Arithmetic(
                 "get_next_sqrt_price: price underflow".into(),
@@ -272,15 +274,27 @@ mod tests {
     fn zero_liquidity_gives_zero_delta() {
         let sqrt_a = get_sqrt_ratio_at_tick(0).unwrap();
         let sqrt_b = get_sqrt_ratio_at_tick(100).unwrap();
-        assert_eq!(get_amount_0_delta(sqrt_a, sqrt_b, 0, false).unwrap(), U256::ZERO);
-        assert_eq!(get_amount_1_delta(sqrt_a, sqrt_b, 0, false).unwrap(), U256::ZERO);
+        assert_eq!(
+            get_amount_0_delta(sqrt_a, sqrt_b, 0, false).unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            get_amount_1_delta(sqrt_a, sqrt_b, 0, false).unwrap(),
+            U256::ZERO
+        );
     }
 
     #[test]
     fn same_sqrt_price_gives_zero_delta() {
         let sqrt = get_sqrt_ratio_at_tick(42).unwrap();
-        assert_eq!(get_amount_0_delta(sqrt, sqrt, 1_000_000, false).unwrap(), U256::ZERO);
-        assert_eq!(get_amount_1_delta(sqrt, sqrt, 1_000_000, false).unwrap(), U256::ZERO);
+        assert_eq!(
+            get_amount_0_delta(sqrt, sqrt, 1_000_000, false).unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            get_amount_1_delta(sqrt, sqrt, 1_000_000, false).unwrap(),
+            U256::ZERO
+        );
     }
 
     #[test]
@@ -409,6 +423,9 @@ mod tests {
     fn from_output_huge_withdrawal_is_rejected() {
         let huge = U256::from(1u64) << 100usize;
         let result = get_next_sqrt_price_from_output(price_1(), 1, huge, false);
-        assert!(result.is_err(), "huge output withdrawal should error, got {result:?}");
+        assert!(
+            result.is_err(),
+            "huge output withdrawal should error, got {result:?}"
+        );
     }
 }

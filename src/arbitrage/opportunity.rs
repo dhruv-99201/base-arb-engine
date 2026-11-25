@@ -178,16 +178,48 @@ mod tests {
 
     #[test]
     fn profitable_round_trip() {
-        let leg1 = leg(DexKind::Aerodrome, POOL_1, TOKEN_A, TOKEN_B, 1000, 1000, 100);
-        let leg2 = leg(DexKind::UniswapV3, POOL_2, TOKEN_B, TOKEN_A, 1000, 1050, 100);
+        let leg1 = leg(
+            DexKind::Aerodrome,
+            POOL_1,
+            TOKEN_A,
+            TOKEN_B,
+            1000,
+            1000,
+            100,
+        );
+        let leg2 = leg(
+            DexKind::UniswapV3,
+            POOL_2,
+            TOKEN_B,
+            TOKEN_A,
+            1000,
+            1050,
+            100,
+        );
         let opp = Opportunity::evaluate(leg1, leg2).unwrap();
         assert_eq!(opp.gross_profit(), I256::try_from(50i64).unwrap());
     }
 
     #[test]
     fn break_even_round_trip() {
-        let leg1 = leg(DexKind::Aerodrome, POOL_1, TOKEN_A, TOKEN_B, 1000, 1000, 100);
-        let leg2 = leg(DexKind::UniswapV3, POOL_2, TOKEN_B, TOKEN_A, 1000, 1000, 100);
+        let leg1 = leg(
+            DexKind::Aerodrome,
+            POOL_1,
+            TOKEN_A,
+            TOKEN_B,
+            1000,
+            1000,
+            100,
+        );
+        let leg2 = leg(
+            DexKind::UniswapV3,
+            POOL_2,
+            TOKEN_B,
+            TOKEN_A,
+            1000,
+            1000,
+            100,
+        );
         let opp = Opportunity::evaluate(leg1, leg2).unwrap();
         assert_eq!(opp.gross_profit(), I256::ZERO);
     }
@@ -196,7 +228,15 @@ mod tests {
     /// zero, never an `Err`.
     #[test]
     fn losing_round_trip() {
-        let leg1 = leg(DexKind::Aerodrome, POOL_1, TOKEN_A, TOKEN_B, 1000, 1000, 100);
+        let leg1 = leg(
+            DexKind::Aerodrome,
+            POOL_1,
+            TOKEN_A,
+            TOKEN_B,
+            1000,
+            1000,
+            100,
+        );
         let leg2 = leg(DexKind::UniswapV3, POOL_2, TOKEN_B, TOKEN_A, 1000, 950, 100);
         let opp = Opportunity::evaluate(leg1, leg2).unwrap();
         assert_eq!(opp.gross_profit(), I256::try_from(-50i64).unwrap());
@@ -204,8 +244,24 @@ mod tests {
 
     #[test]
     fn block_mismatch_is_rejected() {
-        let leg1 = leg(DexKind::Aerodrome, POOL_1, TOKEN_A, TOKEN_B, 1000, 1000, 100);
-        let leg2 = leg(DexKind::UniswapV3, POOL_2, TOKEN_B, TOKEN_A, 1000, 1050, 101);
+        let leg1 = leg(
+            DexKind::Aerodrome,
+            POOL_1,
+            TOKEN_A,
+            TOKEN_B,
+            1000,
+            1000,
+            100,
+        );
+        let leg2 = leg(
+            DexKind::UniswapV3,
+            POOL_2,
+            TOKEN_B,
+            TOKEN_A,
+            1000,
+            1050,
+            101,
+        );
         let err = Opportunity::evaluate(leg1, leg2).unwrap_err();
         assert!(matches!(err, EngineError::State(_)), "got {err:?}");
     }
@@ -220,18 +276,50 @@ mod tests {
 
     #[test]
     fn wrong_intermediate_token_is_rejected() {
-        let leg1 = leg(DexKind::Aerodrome, POOL_1, TOKEN_A, TOKEN_B, 1000, 1000, 100);
+        let leg1 = leg(
+            DexKind::Aerodrome,
+            POOL_1,
+            TOKEN_A,
+            TOKEN_B,
+            1000,
+            1000,
+            100,
+        );
         // leg2 claims to start from TOKEN_C, not TOKEN_B (what leg1 produced).
-        let leg2 = leg(DexKind::UniswapV3, POOL_2, TOKEN_C, TOKEN_A, 1000, 1050, 100);
+        let leg2 = leg(
+            DexKind::UniswapV3,
+            POOL_2,
+            TOKEN_C,
+            TOKEN_A,
+            1000,
+            1050,
+            100,
+        );
         let err = Opportunity::evaluate(leg1, leg2).unwrap_err();
         assert!(matches!(err, EngineError::State(_)), "got {err:?}");
     }
 
     #[test]
     fn wrong_final_token_is_rejected() {
-        let leg1 = leg(DexKind::Aerodrome, POOL_1, TOKEN_A, TOKEN_B, 1000, 1000, 100);
+        let leg1 = leg(
+            DexKind::Aerodrome,
+            POOL_1,
+            TOKEN_A,
+            TOKEN_B,
+            1000,
+            1000,
+            100,
+        );
         // leg2 ends in TOKEN_C, not back in TOKEN_A - not a round trip.
-        let leg2 = leg(DexKind::UniswapV3, POOL_2, TOKEN_B, TOKEN_C, 1000, 1050, 100);
+        let leg2 = leg(
+            DexKind::UniswapV3,
+            POOL_2,
+            TOKEN_B,
+            TOKEN_C,
+            1000,
+            1050,
+            100,
+        );
         let err = Opportunity::evaluate(leg1, leg2).unwrap_err();
         assert!(matches!(err, EngineError::State(_)), "got {err:?}");
     }
@@ -246,15 +334,34 @@ mod tests {
         let aerodrome_pool = address!("cDAC0d6c6C59727a65F871236188350531885C43");
         let uniswap_pool = address!("d0b53D9277642d899DF5C87A3966A349A798F224");
 
-        let leg1 = leg(DexKind::Aerodrome, aerodrome_pool, weth, usdc, 1_000_000_000_000_000_000, 2_753_396_596, 26_000_000);
-        let leg2 = leg(DexKind::UniswapV3, uniswap_pool, usdc, weth, 2_753_396_596, 1_000_500_000_000_000_000, 26_000_000);
+        let leg1 = leg(
+            DexKind::Aerodrome,
+            aerodrome_pool,
+            weth,
+            usdc,
+            1_000_000_000_000_000_000,
+            2_753_396_596,
+            26_000_000,
+        );
+        let leg2 = leg(
+            DexKind::UniswapV3,
+            uniswap_pool,
+            usdc,
+            weth,
+            2_753_396_596,
+            1_000_500_000_000_000_000,
+            26_000_000,
+        );
 
         let opp = Opportunity::evaluate(leg1, leg2).unwrap();
         assert_eq!(opp.leg1().dex, DexKind::Aerodrome);
         assert_eq!(opp.leg2().dex, DexKind::UniswapV3);
         assert_eq!(opp.input_token(), weth);
         assert_eq!(opp.final_token(), weth);
-        assert_eq!(opp.gross_profit(), I256::try_from(500_000_000_000_000i64).unwrap());
+        assert_eq!(
+            opp.gross_profit(),
+            I256::try_from(500_000_000_000_000i64).unwrap()
+        );
     }
 
     /// Exact DEX-order reversal of the test above - same `evaluate` code
@@ -266,13 +373,32 @@ mod tests {
         let aerodrome_pool = address!("cDAC0d6c6C59727a65F871236188350531885C43");
         let uniswap_pool = address!("d0b53D9277642d899DF5C87A3966A349A798F224");
 
-        let leg1 = leg(DexKind::UniswapV3, uniswap_pool, weth, usdc, 1_000_000_000_000_000_000, 2_764_652_000, 26_000_000);
-        let leg2 = leg(DexKind::Aerodrome, aerodrome_pool, usdc, weth, 2_764_652_000, 999_000_000_000_000_000, 26_000_000);
+        let leg1 = leg(
+            DexKind::UniswapV3,
+            uniswap_pool,
+            weth,
+            usdc,
+            1_000_000_000_000_000_000,
+            2_764_652_000,
+            26_000_000,
+        );
+        let leg2 = leg(
+            DexKind::Aerodrome,
+            aerodrome_pool,
+            usdc,
+            weth,
+            2_764_652_000,
+            999_000_000_000_000_000,
+            26_000_000,
+        );
 
         let opp = Opportunity::evaluate(leg1, leg2).unwrap();
         assert_eq!(opp.leg1().dex, DexKind::UniswapV3);
         assert_eq!(opp.leg2().dex, DexKind::Aerodrome);
-        assert_eq!(opp.gross_profit(), I256::try_from(-1_000_000_000_000_000i64).unwrap());
+        assert_eq!(
+            opp.gross_profit(),
+            I256::try_from(-1_000_000_000_000_000i64).unwrap()
+        );
     }
 
     /// Amounts at 2^60 are well beyond f64's 53-bit exact integer range -

@@ -22,6 +22,13 @@ pub enum EngineError {
     #[error("malformed event: {0}")]
     MalformedEvent(String),
 
+    #[error("insufficient Uniswap V3 tick coverage: required tick {required_tick} is outside the confirmed range [{hydrated_tick_lo}, {hydrated_tick_hi}]")]
+    InsufficientV3TickCoverage {
+        required_tick: i32,
+        hydrated_tick_lo: i32,
+        hydrated_tick_hi: i32,
+    },
+
     #[error("dex adapter not implemented: {0}")]
     NotImplemented(String),
 

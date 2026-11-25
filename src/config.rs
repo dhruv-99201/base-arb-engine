@@ -1,4 +1,4 @@
-﻿use crate::error::{EngineError, EngineResult};
+use crate::error::{EngineError, EngineResult};
 use alloy::primitives::Address;
 use std::str::FromStr;
 
@@ -215,9 +215,7 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_UNISWAP_V3_FACTORY.to_string())
             .parse::<Address>()
-            .map_err(|e| {
-                EngineError::Config(format!("invalid UNISWAP_V3_FACTORY_ADDRESS: {e}"))
-            })?;
+            .map_err(|e| EngineError::Config(format!("invalid UNISWAP_V3_FACTORY_ADDRESS: {e}")))?;
 
         let aerodrome_factory_address = std::env::var("AERODROME_FACTORY_ADDRESS")
             .ok()
@@ -246,8 +244,8 @@ impl Config {
                     .map(|s| {
                         s.parse::<Address>().map_err(|e| {
                             EngineError::Config(format!(
-                                "invalid address in AERODROME_SLIPSTREAM_FACTORY_ADDRESSES: '{s}': {e}"
-                            ))
+                            "invalid address in AERODROME_SLIPSTREAM_FACTORY_ADDRESSES: '{s}': {e}"
+                        ))
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -383,7 +381,9 @@ mod tests {
 
     #[test]
     fn valid_configuration_loads() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_WS_URL", "wss://mainnet.base.org/ws");
@@ -398,7 +398,9 @@ mod tests {
 
     #[test]
     fn missing_required_configuration_produces_clear_error() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_CHAIN_ID", "8453");
         // BASE_RPC_URL intentionally missing.
@@ -413,7 +415,9 @@ mod tests {
 
     #[test]
     fn invalid_chain_id_is_rejected() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "not-a-number");
@@ -432,8 +436,14 @@ mod tests {
 
     #[test]
     fn execution_mode_parses_case_insensitively() {
-        assert_eq!("dry_run".parse::<ExecutionMode>().unwrap(), ExecutionMode::DryRun);
-        assert_eq!("LIVE".parse::<ExecutionMode>().unwrap(), ExecutionMode::Live);
+        assert_eq!(
+            "dry_run".parse::<ExecutionMode>().unwrap(),
+            ExecutionMode::DryRun
+        );
+        assert_eq!(
+            "LIVE".parse::<ExecutionMode>().unwrap(),
+            ExecutionMode::Live
+        );
         assert_eq!(
             "simulation".parse::<ExecutionMode>().unwrap(),
             ExecutionMode::Simulation
@@ -443,7 +453,9 @@ mod tests {
 
     #[test]
     fn empty_base_ws_url_is_treated_as_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -459,7 +471,9 @@ mod tests {
 
     #[test]
     fn unset_base_ws_url_is_none() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -472,7 +486,9 @@ mod tests {
 
     #[test]
     fn http_poll_interval_defaults_to_a_safe_value_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -484,7 +500,9 @@ mod tests {
 
     #[test]
     fn http_poll_interval_is_configurable() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -497,7 +515,9 @@ mod tests {
 
     #[test]
     fn zero_http_poll_interval_is_rejected() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -510,7 +530,9 @@ mod tests {
 
     #[test]
     fn factory_addresses_default_to_verified_base_deployments() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -537,7 +559,9 @@ mod tests {
 
     #[test]
     fn slipstream_factories_are_overridable_with_a_single_address() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -558,7 +582,9 @@ mod tests {
 
     #[test]
     fn slipstream_factories_support_a_configurable_list() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -585,7 +611,9 @@ mod tests {
 
     #[test]
     fn slipstream_factories_can_be_explicitly_disabled() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -601,7 +629,9 @@ mod tests {
 
     #[test]
     fn slipstream_factories_reject_a_malformed_address_in_the_list() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -617,7 +647,9 @@ mod tests {
 
     #[test]
     fn log_start_block_defaults_to_latest() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -629,7 +661,9 @@ mod tests {
 
     #[test]
     fn log_start_block_accepts_explicit_block_number() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");
@@ -642,7 +676,9 @@ mod tests {
 
     #[test]
     fn zero_log_poll_max_block_range_is_rejected() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_env();
         std::env::set_var("BASE_RPC_URL", "https://mainnet.base.org");
         std::env::set_var("BASE_CHAIN_ID", "8453");

@@ -1,4 +1,4 @@
-﻿//! `discover-test` CLI subcommand: read-only verification of pool discovery
+//! `discover-test` CLI subcommand: read-only verification of pool discovery
 //! against a caller-supplied historical block range.
 //!
 //! Reuses the exact same `HttpLogPoller` + discovery adapters + decoders
@@ -9,15 +9,15 @@
 //! signs or submits anything - it only reads logs and prints what it
 //! decoded.
 
+use crate::arbitrage::{
+    detect_cross_dex_opportunities_at_block, HistoricalAerodromeInput, HistoricalQuoteInput,
+    HistoricalUniswapV3Input, RouteEvaluationFailure, RouteOutcome,
+};
 use crate::chain::log_poller::HttpLogPoller;
 use crate::config::Config;
 use crate::dex::discovery::{
     AerodromeClassicDiscovery, AerodromeSlipstreamDiscovery, DiscoveredPool, DiscoveryParams,
     PoolDiscoveryAdapter, UniswapV3Discovery,
-};
-use crate::arbitrage::{
-    detect_cross_dex_opportunities_at_block, HistoricalAerodromeInput, HistoricalQuoteInput,
-    HistoricalUniswapV3Input, RouteEvaluationFailure, RouteOutcome,
 };
 use crate::dex::{AerodromeAdapter, UniswapV3Adapter};
 use crate::error::{EngineError, EngineResult};
@@ -123,7 +123,8 @@ const INSPECT_V3_WORD_RADIUS: i32 = 1;
 pub enum DiscoverTestCommand {
     Help,
     Run { from_block: u64, to_block: u64 },
-}/// Parse `discover-test` subcommand arguments (everything after
+}
+/// Parse `discover-test` subcommand arguments (everything after
 /// `discover-test` itself). Pure function - no I/O, fully unit-testable.
 pub fn parse_discover_test_args(args: &[String]) -> Result<DiscoverTestCommand, String> {
     // --help/-h wins over everything else, including otherwise-invalid args -
@@ -171,7 +172,10 @@ pub fn parse_discover_test_args(args: &[String]) -> Result<DiscoverTestCommand, 
         ));
     }
 
-    Ok(DiscoverTestCommand::Run { from_block, to_block })
+    Ok(DiscoverTestCommand::Run {
+        from_block,
+        to_block,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,10 +199,9 @@ pub fn parse_inspect_tx_args(args: &[String]) -> Result<InspectTxCommand, String
                 let raw = args
                     .get(i + 1)
                     .ok_or_else(|| "--tx requires a value".to_string())?;
-                tx_hash = Some(
-                    raw.parse::<B256>()
-                        .map_err(|_| format!("invalid --tx value: '{raw}' (expected a 0x-prefixed 32-byte hash)"))?,
-                );
+                tx_hash = Some(raw.parse::<B256>().map_err(|_| {
+                    format!("invalid --tx value: '{raw}' (expected a 0x-prefixed 32-byte hash)")
+                })?);
                 i += 2;
             }
             other => return Err(format!("unrecognized argument: '{other}'")),
@@ -297,7 +300,10 @@ pub async fn run_discover_test(
 
             match adapter.decode_pool_created(log) {
                 Ok(discovered) => {
-                    println!("{}", format_pool_created_report(dex_name, factory, &discovered));
+                    println!(
+                        "{}",
+                        format_pool_created_report(dex_name, factory, &discovered)
+                    );
                     total_found += 1;
                 }
                 Err(e) => {
@@ -765,7 +771,9 @@ pub fn parse_inspect_arb_args(args: &[String]) -> Result<InspectArbCommand, Stri
             "--word-radius" => {
                 let raw = value(args, i, "--word-radius")?;
                 let parsed = raw.parse::<i32>().map_err(|_| {
-                    format!("invalid --word-radius value: '{raw}' (expected a non-negative integer)")
+                    format!(
+                        "invalid --word-radius value: '{raw}' (expected a non-negative integer)"
+                    )
                 })?;
                 if parsed < 0 {
                     return Err(format!("--word-radius must be non-negative, got {parsed}"));
@@ -912,9 +920,9 @@ pub fn format_inspect_arb_report(header: &InspectArbHeader, outcomes: &[RouteOut
             Err(RouteEvaluationFailure::InvalidRouteCandidateMapping { error }) => out.push_str(
                 &format!("status=FAILED kind=InvalidRouteCandidateMapping\nerror={error}\n"),
             ),
-            Err(RouteEvaluationFailure::Leg1QuoteFailed { error }) => {
-                out.push_str(&format!("status=FAILED kind=Leg1QuoteFailed\nerror={error}\n"))
-            }
+            Err(RouteEvaluationFailure::Leg1QuoteFailed { error }) => out.push_str(&format!(
+                "status=FAILED kind=Leg1QuoteFailed\nerror={error}\n"
+            )),
             Err(RouteEvaluationFailure::Leg2QuoteFailed { leg1, error }) => out.push_str(&format!(
                 "status=FAILED kind=Leg2QuoteFailed\n\
                  leg1_amount_in_raw={}\n\
@@ -922,8 +930,8 @@ pub fn format_inspect_arb_report(header: &InspectArbHeader, outcomes: &[RouteOut
                  error={error}\n",
                 leg1.amount_in, leg1.amount_out,
             )),
-            Err(RouteEvaluationFailure::OpportunityEvaluationFailed { leg1, leg2, error }) => {
-                out.push_str(&format!(
+            Err(RouteEvaluationFailure::OpportunityEvaluationFailed { leg1, leg2, error }) => out
+                .push_str(&format!(
                     "status=FAILED kind=OpportunityEvaluationFailed\n\
                      leg1_amount_in_raw={}\n\
                      leg1_amount_out_raw={}\n\
@@ -931,8 +939,7 @@ pub fn format_inspect_arb_report(header: &InspectArbHeader, outcomes: &[RouteOut
                      leg2_amount_out_raw={}\n\
                      error={error}\n",
                     leg1.amount_in, leg1.amount_out, leg2.amount_in, leg2.amount_out,
-                ))
-            }
+                )),
         }
     }
 
@@ -1034,7 +1041,8 @@ pub async fn run_inspect_arb(
     );
 
     let aerodrome_input = HistoricalAerodromeInput::new(block, aerodrome_state)?;
-    let uniswap_input = HistoricalUniswapV3Input::from_pinned_read(block, (uniswap_state, hydrated))?;
+    let uniswap_input =
+        HistoricalUniswapV3Input::from_pinned_read(block, (uniswap_state, hydrated))?;
 
     validate_pair_and_direction(
         aerodrome_pool,
@@ -1048,7 +1056,8 @@ pub async fn run_inspect_arb(
         HistoricalQuoteInput::Aerodrome(aerodrome_input),
         HistoricalQuoteInput::UniswapV3(uniswap_input),
     ];
-    let outcomes = detect_cross_dex_opportunities_at_block(block, token_in, amount_in, &candidates)?;
+    let outcomes =
+        detect_cross_dex_opportunities_at_block(block, token_in, amount_in, &candidates)?;
 
     let header = InspectArbHeader {
         chain_id,
@@ -1633,8 +1642,7 @@ mod tests {
 
     #[test]
     fn parses_valid_args() {
-        let result =
-            parse_discover_test_args(&args(&["--from-block", "100", "--to-block", "200"]));
+        let result = parse_discover_test_args(&args(&["--from-block", "100", "--to-block", "200"]));
         assert_eq!(
             result,
             Ok(DiscoverTestCommand::Run {
@@ -1646,8 +1654,7 @@ mod tests {
 
     #[test]
     fn parses_valid_args_in_reverse_order() {
-        let result =
-            parse_discover_test_args(&args(&["--to-block", "200", "--from-block", "100"]));
+        let result = parse_discover_test_args(&args(&["--to-block", "200", "--from-block", "100"]));
         assert_eq!(
             result,
             Ok(DiscoverTestCommand::Run {
@@ -1688,9 +1695,8 @@ mod tests {
 
     #[test]
     fn non_numeric_block_is_rejected() {
-        let err =
-            parse_discover_test_args(&args(&["--from-block", "abc", "--to-block", "200"]))
-                .unwrap_err();
+        let err = parse_discover_test_args(&args(&["--from-block", "abc", "--to-block", "200"]))
+            .unwrap_err();
         assert!(err.contains("--from-block"));
     }
 
@@ -1715,8 +1721,7 @@ mod tests {
 
     #[test]
     fn equal_from_and_to_block_is_valid() {
-        let result =
-            parse_discover_test_args(&args(&["--from-block", "100", "--to-block", "100"]));
+        let result = parse_discover_test_args(&args(&["--from-block", "100", "--to-block", "100"]));
         assert_eq!(
             result,
             Ok(DiscoverTestCommand::Run {
@@ -1956,7 +1961,8 @@ mod tests {
 
     #[test]
     fn inspect_v3_missing_amount_in_is_rejected() {
-        let err = parse_inspect_v3_args(&args(&["--pool", SAMPLE_POOL, "--block", "1"])).unwrap_err();
+        let err =
+            parse_inspect_v3_args(&args(&["--pool", SAMPLE_POOL, "--block", "1"])).unwrap_err();
         assert!(err.contains("--amount-in"));
     }
 
@@ -2007,8 +2013,14 @@ mod tests {
 
     #[test]
     fn inspect_v3_zero_for_one_absent_is_false() {
-        let result =
-            parse_inspect_v3_args(&args(&["--pool", SAMPLE_POOL, "--block", "1", "--amount-in", "1"]));
+        let result = parse_inspect_v3_args(&args(&[
+            "--pool",
+            SAMPLE_POOL,
+            "--block",
+            "1",
+            "--amount-in",
+            "1",
+        ]));
         match result {
             Ok(InspectV3Command::Run { zero_for_one, .. }) => assert!(!zero_for_one),
             other => panic!("expected Run, got {other:?}"),
@@ -2139,8 +2151,19 @@ mod tests {
             .unwrap();
 
         let report = format_inspect_v3_report(
-            pool, 1, token0, token1, 3000, 60, U256::from(1u64), 0, 0, &hydrated,
-            U256::from(1u64), false, &result,
+            pool,
+            1,
+            token0,
+            token1,
+            3000,
+            60,
+            U256::from(1u64),
+            0,
+            0,
+            &hydrated,
+            U256::from(1u64),
+            false,
+            &result,
         );
         assert!(report.contains("direction=one_for_zero"));
     }
@@ -2259,7 +2282,10 @@ mod tests {
         for flag in ["--aerodrome-pool", "--uniswap-v3-pool", "--token-in"] {
             let err =
                 parse_inspect_arb_args(&arb_args_replacing(flag, "0xnotanaddress")).unwrap_err();
-            assert!(err.contains("invalid") && err.contains(flag), "{flag}: {err}");
+            assert!(
+                err.contains("invalid") && err.contains(flag),
+                "{flag}: {err}"
+            );
         }
     }
 
@@ -2314,7 +2340,9 @@ mod tests {
     fn inspect_arb_pair_validation() {
         let weth: Address = ARB_WETH.parse().unwrap();
         let usdc: Address = ARB_USDC.parse().unwrap();
-        let other: Address = "0x0000000000000000000000000000000000000abc".parse().unwrap();
+        let other: Address = "0x0000000000000000000000000000000000000abc"
+            .parse()
+            .unwrap();
         let a: Address = ARB_AERO.parse().unwrap();
         let v: Address = ARB_V3.parse().unwrap();
 
@@ -2325,7 +2353,10 @@ mod tests {
         // Different pair rejected, message names both pools.
         let err = validate_pair_and_direction(a, (weth, usdc), v, (weth, other), weth).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains(&a.to_string()) && msg.contains(&v.to_string()), "{msg}");
+        assert!(
+            msg.contains(&a.to_string()) && msg.contains(&v.to_string()),
+            "{msg}"
+        );
 
         // token_in not in the pair rejected.
         let err = validate_pair_and_direction(a, (weth, usdc), v, (weth, usdc), other).unwrap_err();
@@ -2414,7 +2445,9 @@ mod tests {
         }
 
         fn mixed_outcomes(amount_in: U256) -> Vec<RouteOutcome> {
-            let bad_pool: Address = "0x0000000000000000000000000000000000000091".parse().unwrap();
+            let bad_pool: Address = "0x0000000000000000000000000000000000000091"
+                .parse()
+                .unwrap();
             let candidates = vec![
                 aerodrome(ARB_AERO.parse().unwrap(), Some(U256::from(30u64))),
                 aerodrome(bad_pool, None), // unhydrated fee -> real quote failure
@@ -2487,7 +2520,10 @@ mod tests {
                     }
                 }
             }
-            assert!(saw_negative, "fixture should contain a negative gross profit");
+            assert!(
+                saw_negative,
+                "fixture should contain a negative gross profit"
+            );
         }
 
         #[test]
@@ -2519,8 +2555,13 @@ mod tests {
         #[test]
         fn report_with_no_matching_route_does_not_fabricate_one() {
             let amount = U256::from(1_000u64);
-            let other: Address = "0x0000000000000000000000000000000000000abc".parse().unwrap();
-            let candidates = vec![aerodrome(ARB_AERO.parse().unwrap(), Some(U256::from(30u64))), v3()];
+            let other: Address = "0x0000000000000000000000000000000000000abc"
+                .parse()
+                .unwrap();
+            let candidates = vec![
+                aerodrome(ARB_AERO.parse().unwrap(), Some(U256::from(30u64))),
+                v3(),
+            ];
             let outcomes =
                 detect_cross_dex_opportunities_at_block(BLOCK, other, amount, &candidates).unwrap();
             assert!(outcomes.is_empty());

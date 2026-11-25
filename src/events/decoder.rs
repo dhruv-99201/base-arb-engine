@@ -1,4 +1,4 @@
-﻿//! Decodes raw chain logs into normalized `MarketEvent`s.
+//! Decodes raw chain logs into normalized `MarketEvent`s.
 //!
 //! Decoding is protocol-specific (Aerodrome's Solidly-style Swap event vs
 //! Uniswap V3's concentrated-liquidity Swap event have different shapes),
@@ -105,9 +105,8 @@ pub fn decode_aerodrome_log(
         .ok_or_else(|| EngineError::MalformedEvent("log missing log_index".into()))?;
     let pool_address = log.inner.address;
 
-    let decoded_log = AerodromeSwap::decode_log(&log.inner).map_err(|e| {
-        EngineError::Decode(format!("failed to decode AerodromeSwap log: {e}"))
-    })?;
+    let decoded_log = AerodromeSwap::decode_log(&log.inner)
+        .map_err(|e| EngineError::Decode(format!("failed to decode AerodromeSwap log: {e}")))?;
     let decoded = decoded_log.data;
 
     // Solidly-style pools report gross in/out per side rather than a single
@@ -174,9 +173,8 @@ pub fn decode_uniswap_v3_log(
         .ok_or_else(|| EngineError::MalformedEvent("log missing log_index".into()))?;
     let pool_address = log.inner.address;
 
-    let decoded_log = UniswapV3Swap::decode_log(&log.inner).map_err(|e| {
-        EngineError::Decode(format!("failed to decode UniswapV3Swap log: {e}"))
-    })?;
+    let decoded_log = UniswapV3Swap::decode_log(&log.inner)
+        .map_err(|e| EngineError::Decode(format!("failed to decode UniswapV3Swap log: {e}")))?;
     let decoded = decoded_log.data;
 
     let amount0 = i128::try_from(decoded.amount0)
@@ -238,9 +236,8 @@ pub fn decode_aerodrome_slipstream_log(
         .ok_or_else(|| EngineError::MalformedEvent("log missing log_index".into()))?;
     let pool_address = log.inner.address;
 
-    let decoded_log = UniswapV3Swap::decode_log(&log.inner).map_err(|e| {
-        EngineError::Decode(format!("failed to decode Slipstream Swap log: {e}"))
-    })?;
+    let decoded_log = UniswapV3Swap::decode_log(&log.inner)
+        .map_err(|e| EngineError::Decode(format!("failed to decode Slipstream Swap log: {e}")))?;
     let decoded = decoded_log.data;
 
     let amount0 = i128::try_from(decoded.amount0)

@@ -1,4 +1,4 @@
-﻿//! ERC-20 token metadata hydration, with caching so the same token contract
+//! ERC-20 token metadata hydration, with caching so the same token contract
 //! is never queried more than once per process lifetime.
 //!
 //! Decimals are treated as required (a pool can't be safely reasoned about
@@ -59,19 +59,19 @@ impl TokenMetadataCache {
         let provider = ProviderBuilder::new().connect_http(url);
         let contract = IERC20Metadata::new(address, provider);
 
-        let decimals = contract.decimals().call().await.map_err(|e| EngineError::Dex {
-            dex: "erc20".into(),
-            reason: format!("decimals() failed for {address}: {e}"),
-        })?;
+        let decimals = contract
+            .decimals()
+            .call()
+            .await
+            .map_err(|e| EngineError::Dex {
+                dex: "erc20".into(),
+                reason: format!("decimals() failed for {address}: {e}"),
+            })?;
 
         // Best-effort: a nonstandard/missing symbol or name must never fail
         // hydration - decimals is the only value later pricing math depends
         // on.
-        let symbol = contract
-            .symbol()
-            .call()
-            .await
-            .unwrap_or_default();
+        let symbol = contract.symbol().call().await.unwrap_or_default();
         let _name = contract.name().call().await.unwrap_or_default();
 
         let token = Token {

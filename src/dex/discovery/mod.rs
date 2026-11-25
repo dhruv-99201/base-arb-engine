@@ -1,4 +1,4 @@
-﻿//! Pool discovery: turning factory `PoolCreated`-style events into pools
+//! Pool discovery: turning factory `PoolCreated`-style events into pools
 //! the registry can hydrate. Deliberately separate from `dex::traits::DexAdapter`
 //! (which handles state/quoting for pools we already know about) - discovery
 //! is a distinct concern with its own event shapes per factory.
@@ -22,11 +22,16 @@ pub use uniswap_v3::UniswapV3Discovery;
 /// creation-time parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryParams {
-    AerodromeClassic { stable: bool },
+    AerodromeClassic {
+        stable: bool,
+    },
     /// `fee` is `None` for factories whose `PoolCreated` event doesn't
     /// carry a fee (e.g. Aerodrome Slipstream's `CLFactory` - fee there
     /// routes through a separate `getSwapFee(pool)` call, not this event).
-    ConcentratedLiquidity { tick_spacing: i32, fee: Option<u32> },
+    ConcentratedLiquidity {
+        tick_spacing: i32,
+        fee: Option<u32>,
+    },
 }
 
 /// A pool observed via a factory event, not yet hydrated.

@@ -1,4 +1,4 @@
-﻿//! Single-step swap math: `compute_swap_step`, the core of the tick-crossing
+//! Single-step swap math: `compute_swap_step`, the core of the tick-crossing
 //! swap loop. For one segment of a swap (between two adjacent initialized
 //! ticks, or between the current price and a target price), computes how
 //! much input is consumed, how much output is produced, the resulting sqrt
@@ -75,9 +75,19 @@ pub fn compute_swap_step(
         )?;
 
         amount_in = if zero_for_one {
-            get_amount_0_delta(sqrt_ratio_target_x96, sqrt_ratio_current_x96, liquidity, true)?
+            get_amount_0_delta(
+                sqrt_ratio_target_x96,
+                sqrt_ratio_current_x96,
+                liquidity,
+                true,
+            )?
         } else {
-            get_amount_1_delta(sqrt_ratio_current_x96, sqrt_ratio_target_x96, liquidity, true)?
+            get_amount_1_delta(
+                sqrt_ratio_current_x96,
+                sqrt_ratio_target_x96,
+                liquidity,
+                true,
+            )?
         };
 
         sqrt_ratio_next_x96 = if amount_remaining_less_fee >= amount_in {
@@ -94,9 +104,19 @@ pub fn compute_swap_step(
         let amount_remaining_abs: U256 = amount_remaining.unsigned_abs();
 
         amount_out = if zero_for_one {
-            get_amount_1_delta(sqrt_ratio_target_x96, sqrt_ratio_current_x96, liquidity, false)?
+            get_amount_1_delta(
+                sqrt_ratio_target_x96,
+                sqrt_ratio_current_x96,
+                liquidity,
+                false,
+            )?
         } else {
-            get_amount_0_delta(sqrt_ratio_current_x96, sqrt_ratio_target_x96, liquidity, false)?
+            get_amount_0_delta(
+                sqrt_ratio_current_x96,
+                sqrt_ratio_target_x96,
+                liquidity,
+                false,
+            )?
         };
 
         sqrt_ratio_next_x96 = if amount_remaining_abs >= amount_out {
@@ -122,7 +142,12 @@ pub fn compute_swap_step(
         amount_out = if max_reached && !exact_in {
             amount_out
         } else {
-            get_amount_1_delta(sqrt_ratio_next_x96, sqrt_ratio_current_x96, liquidity, false)?
+            get_amount_1_delta(
+                sqrt_ratio_next_x96,
+                sqrt_ratio_current_x96,
+                liquidity,
+                false,
+            )?
         };
     } else {
         amount_in = if max_reached && exact_in {
@@ -133,7 +158,12 @@ pub fn compute_swap_step(
         amount_out = if max_reached && !exact_in {
             amount_out
         } else {
-            get_amount_0_delta(sqrt_ratio_current_x96, sqrt_ratio_next_x96, liquidity, false)?
+            get_amount_0_delta(
+                sqrt_ratio_current_x96,
+                sqrt_ratio_next_x96,
+                liquidity,
+                false,
+            )?
         };
     }
 
@@ -150,9 +180,9 @@ pub fn compute_swap_step(
     let fee_amount = if exact_in && sqrt_ratio_next_x96 != sqrt_ratio_target_x96 {
         // Partial step on exact-in: the leftover input becomes fee.
         let amount_remaining_u: U256 = amount_remaining.into_raw();
-        amount_remaining_u.checked_sub(amount_in).ok_or_else(|| {
-            EngineError::Arithmetic("compute_swap_step: fee underflow".into())
-        })?
+        amount_remaining_u
+            .checked_sub(amount_in)
+            .ok_or_else(|| EngineError::Arithmetic("compute_swap_step: fee underflow".into()))?
     } else {
         // Reached the target (or exact-out): fee is computed from amount_in.
         mul_div_rounding_up(
@@ -243,7 +273,10 @@ mod tests {
         let liq: u128 = 2_000_000_000_000_000_000_000_000u128;
         let small_in = I256::try_from(U256::from(1_000u64)).unwrap();
         let step = compute_swap_step(p_current, p_target, liq, small_in, 3000).unwrap();
-        assert_ne!(step.sqrt_ratio_next_x96, p_target, "should not reach target");
+        assert_ne!(
+            step.sqrt_ratio_next_x96, p_target,
+            "should not reach target"
+        );
         assert!(step.sqrt_ratio_next_x96 < p_current);
         assert_eq!(step.amount_in + step.fee_amount, U256::from(1_000u64));
     }
@@ -301,9 +334,12 @@ mod tests {
         let liq: u128 = 2_000_000_000_000_000_000;
         let huge_in = I256::try_from(U256::from(10u128.pow(20))).unwrap();
         let step = compute_swap_step(p_current, p_target, liq, huge_in, 10_000).unwrap();
-        let expected =
-            mul_div_rounding_up(step.amount_in, U256::from(10_000u64), U256::from(990_000u64))
-                .unwrap();
+        let expected = mul_div_rounding_up(
+            step.amount_in,
+            U256::from(10_000u64),
+            U256::from(990_000u64),
+        )
+        .unwrap();
         assert_eq!(step.fee_amount, expected);
     }
 
@@ -335,6 +371,9 @@ mod tests {
         let liq: u128 = u128::MAX / 2;
         let big_in = I256::try_from(U256::from(1u128) << 100usize).unwrap();
         let step = compute_swap_step(p_current, p_target, liq, big_in, 3000);
-        assert!(step.is_ok(), "large values must not panic or silently corrupt: {step:?}");
+        assert!(
+            step.is_ok(),
+            "large values must not panic or silently corrupt: {step:?}"
+        );
     }
 }

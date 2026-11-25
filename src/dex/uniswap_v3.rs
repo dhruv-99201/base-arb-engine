@@ -145,8 +145,15 @@ impl UniswapV3Adapter {
         current_tick: i32,
         word_radius: i32,
     ) -> EngineResult<HydratedTicks> {
-        self.hydrate_initialized_ticks_impl(rpc_url, pool, tick_spacing, current_tick, word_radius, None)
-            .await
+        self.hydrate_initialized_ticks_impl(
+            rpc_url,
+            pool,
+            tick_spacing,
+            current_tick,
+            word_radius,
+            None,
+        )
+        .await
     }
 
     /// Shared implementation behind [`Self::hydrate_initialized_ticks`]
@@ -239,7 +246,11 @@ impl UniswapV3Adapter {
         let hydrated_tick_lo = (word_pos_center - word_radius) * 256 * tick_spacing;
         let hydrated_tick_hi = ((word_pos_center + word_radius) * 256 + 255) * tick_spacing;
 
-        Ok(HydratedTicks::new(initialized_ticks, hydrated_tick_lo, hydrated_tick_hi))
+        Ok(HydratedTicks::new(
+            initialized_ticks,
+            hydrated_tick_lo,
+            hydrated_tick_hi,
+        ))
     }
 
     /// The pinned-state interface: reads `slot0`, `liquidity`, `fee`,
@@ -367,10 +378,13 @@ impl UniswapV3Adapter {
         if let Some(b) = block_id {
             tick_spacing_call = tick_spacing_call.block(b);
         }
-        let tick_spacing = tick_spacing_call.call().await.map_err(|e| EngineError::Dex {
-            dex: self.name().into(),
-            reason: format!("tickSpacing() failed: {e}"),
-        })?;
+        let tick_spacing = tick_spacing_call
+            .call()
+            .await
+            .map_err(|e| EngineError::Dex {
+                dex: self.name().into(),
+                reason: format!("tickSpacing() failed: {e}"),
+            })?;
 
         // Added for `inspect-v3` (B's audit item 3). Deliberately gated on
         // `block_id.is_some()` (i.e. `at_block: Some(_)`, the pinned path)

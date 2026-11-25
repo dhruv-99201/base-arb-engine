@@ -273,10 +273,14 @@ impl DexAdapter for AerodromeAdapter {
                 reason: format!("getReserves() failed: {e}"),
             })?;
 
-        let stable = contract.stable().call().await.map_err(|e| EngineError::Dex {
-            dex: self.name().into(),
-            reason: format!("stable() failed: {e}"),
-        })?;
+        let stable = contract
+            .stable()
+            .call()
+            .await
+            .map_err(|e| EngineError::Dex {
+                dex: self.name().into(),
+                reason: format!("stable() failed: {e}"),
+            })?;
 
         // Day 3: real per-pool fee from the factory - never a hardcoded
         // constant (Aerodrome supports per-pool fee overrides).
@@ -350,7 +354,9 @@ mod tests {
         };
 
         match pool.kind {
-            PoolKind::Aerodrome { stable, fee_bps, .. } => {
+            PoolKind::Aerodrome {
+                stable, fee_bps, ..
+            } => {
                 assert!(!stable);
                 assert_eq!(fee_bps, Some(U256::from(30u64)));
             }
@@ -489,7 +495,9 @@ mod tests {
         )
         .unwrap();
         match state.pool.kind {
-            PoolKind::Aerodrome { stable, fee_bps, .. } => {
+            PoolKind::Aerodrome {
+                stable, fee_bps, ..
+            } => {
                 assert!(stable);
                 assert_eq!(fee_bps, Some(U256::from(4u64)));
             }

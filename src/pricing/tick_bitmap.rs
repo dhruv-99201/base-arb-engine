@@ -1,4 +1,4 @@
-﻿//! Uniswap V3-compatible initialized-tick lookup, ported from the real
+//! Uniswap V3-compatible initialized-tick lookup, ported from the real
 //! `TickBitmap.sol`/`BitMath.sol` source at
 //! `github.com/Uniswap/v3-core/blob/main/contracts/libraries/`.
 //!
@@ -197,7 +197,13 @@ mod tests {
         (sparse, dense)
     }
 
-    fn assert_matches(sparse: &BTreeMap<i32, i128>, dense: &ReferenceBitmap, tick: i32, spacing: i32, lte: bool) {
+    fn assert_matches(
+        sparse: &BTreeMap<i32, i128>,
+        dense: &ReferenceBitmap,
+        tick: i32,
+        spacing: i32,
+        lte: bool,
+    ) {
         let sparse_result = next_initialized_tick_within_one_word(sparse, tick, spacing, lte);
         let dense_result = dense.next_initialized_tick_within_one_word(tick, spacing, lte);
         assert_eq!(
@@ -240,8 +246,7 @@ mod tests {
     #[test]
     fn current_tick_itself_is_included_when_searching_downward() {
         let (sparse, dense) = build(&[100], 1);
-        let (next, initialized) =
-            next_initialized_tick_within_one_word(&sparse, 100, 1, true);
+        let (next, initialized) = next_initialized_tick_within_one_word(&sparse, 100, 1, true);
         assert!(initialized);
         assert_eq!(next, 100, "lte search must include the tick itself");
         assert_matches(&sparse, &dense, 100, 1, true);
@@ -250,12 +255,14 @@ mod tests {
     #[test]
     fn current_tick_itself_is_excluded_when_searching_upward() {
         let (sparse, dense) = build(&[100], 1);
-        let (next, initialized) =
-            next_initialized_tick_within_one_word(&sparse, 100, 1, false);
+        let (next, initialized) = next_initialized_tick_within_one_word(&sparse, 100, 1, false);
         // Must NOT report tick 100 itself as the answer even though it's
         // initialized - "gt" search is strictly exclusive.
         assert_ne!(next, 100);
-        assert!(!initialized, "no other initialized tick above 100 in this word");
+        assert!(
+            !initialized,
+            "no other initialized tick above 100 in this word"
+        );
         assert_matches(&sparse, &dense, 100, 1, false);
     }
 
@@ -296,7 +303,9 @@ mod tests {
     fn spacing_10() {
         let spacing = 10;
         let (sparse, dense) = build(&[-500, -100, 0, 100, 500, 12340], spacing);
-        for tick in [-600, -500, -101, -100, -99, 0, 99, 100, 101, 12330, 12340, 12350] {
+        for tick in [
+            -600, -500, -101, -100, -99, 0, 99, 100, 101, 12330, 12340, 12350,
+        ] {
             assert_matches(&sparse, &dense, tick, spacing, true);
             assert_matches(&sparse, &dense, tick, spacing, false);
         }
@@ -316,7 +325,9 @@ mod tests {
     fn spacing_200() {
         let spacing = 200;
         let (sparse, dense) = build(&[-20000, -200, 0, 200, 20000], spacing);
-        for tick in [-20200, -20000, -201, -200, -199, 0, 199, 200, 201, 19999, 20000, 20200] {
+        for tick in [
+            -20200, -20000, -201, -200, -199, 0, 199, 200, 201, 19999, 20000, 20200,
+        ] {
             assert_matches(&sparse, &dense, tick, spacing, true);
             assert_matches(&sparse, &dense, tick, spacing, false);
         }

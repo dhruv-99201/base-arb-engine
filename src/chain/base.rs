@@ -87,8 +87,11 @@ impl BaseChainSource {
     /// This is WebSocket-only: it is only ever invoked when `ws_url` is
     /// configured, so unbounded retry here reflects the operator's explicit
     /// choice to run against a WebSocket endpoint (see module docs).
-    async fn run_with_reconnect<T, F, Fut>(stream_name: &'static str, tx: mpsc::Sender<T>, connect_and_stream: F)
-    where
+    async fn run_with_reconnect<T, F, Fut>(
+        stream_name: &'static str,
+        tx: mpsc::Sender<T>,
+        connect_and_stream: F,
+    ) where
         T: Send + 'static,
         F: Fn(mpsc::Sender<T>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = EngineResult<()>> + Send,
@@ -96,7 +99,11 @@ impl BaseChainSource {
         let mut backoff = INITIAL_BACKOFF;
         loop {
             if tx.is_closed() {
-                tracing::info!(source = "websocket", stream = stream_name, "receiver dropped, stopping reconnect loop");
+                tracing::info!(
+                    source = "websocket",
+                    stream = stream_name,
+                    "receiver dropped, stopping reconnect loop"
+                );
                 return;
             }
 
@@ -106,7 +113,11 @@ impl BaseChainSource {
                     // Stream ended cleanly (e.g. provider closed it) - treat
                     // as a disconnect and retry with reset backoff, since we
                     // did make forward progress.
-                    tracing::warn!(source = "websocket", stream = stream_name, "stream ended, reconnecting");
+                    tracing::warn!(
+                        source = "websocket",
+                        stream = stream_name,
+                        "stream ended, reconnecting"
+                    );
                     backoff = INITIAL_BACKOFF;
                 }
                 Err(err) => {
@@ -134,7 +145,11 @@ impl BaseChainSource {
     /// errors, rate limiting, etc.) are logged and retried on the next tick
     /// rather than tearing down the loop - there is no "give up" state here
     /// by design, since HTTP fallback is itself already the fallback.
-    async fn run_http_poll(http_url: String, poll_interval: Duration, tx: mpsc::Sender<BlockState>) {
+    async fn run_http_poll(
+        http_url: String,
+        poll_interval: Duration,
+        tx: mpsc::Sender<BlockState>,
+    ) {
         tracing::info!(
             source = "http_poll",
             poll_interval_secs = poll_interval.as_secs(),
@@ -163,7 +178,11 @@ impl BaseChainSource {
                             return; // receiver dropped
                         }
                     } else {
-                        tracing::debug!(source = "http_poll", block = number, "no new block since last poll");
+                        tracing::debug!(
+                            source = "http_poll",
+                            block = number,
+                            "no new block since last poll"
+                        );
                     }
                 }
                 Err(err) => {
@@ -227,12 +246,13 @@ impl ChainEventSource for BaseChainSource {
                             let provider = ProviderBuilder::new()
                                 .connect_ws(WsConnect::new(ws_url))
                                 .await
-                                .map_err(|e| EngineError::Chain(format!("ws connect failed: {e}")))?;
+                                .map_err(|e| {
+                                    EngineError::Chain(format!("ws connect failed: {e}"))
+                                })?;
 
-                            let sub = provider
-                                .subscribe_blocks()
-                                .await
-                                .map_err(|e| EngineError::Chain(format!("subscribe_blocks failed: {e}")))?;
+                            let sub = provider.subscribe_blocks().await.map_err(|e| {
+                                EngineError::Chain(format!("subscribe_blocks failed: {e}"))
+                            })?;
 
                             let mut stream = sub.into_stream();
                             while let Some(header) = stream.next().await {

@@ -1,4 +1,4 @@
-﻿//! Aerodrome Classic **volatile** pool exact-input quote. Stable pools are
+//! Aerodrome Classic **volatile** pool exact-input quote. Stable pools are
 //! explicitly out of scope (different curve entirely - see Day 2/3 specs).
 //!
 //! Fee-on-input, then constant-product:
@@ -92,9 +92,9 @@ pub fn quote_exact_input_aerodrome_volatile(
         .checked_sub(fee)
         .ok_or_else(|| EngineError::Arithmetic("fee exceeds amount_in".into()))?;
 
-    let denominator = reserve_in
-        .checked_add(amount_in_after_fee)
-        .ok_or_else(|| EngineError::Arithmetic("reserve_in + amount_in_after_fee overflows".into()))?;
+    let denominator = reserve_in.checked_add(amount_in_after_fee).ok_or_else(|| {
+        EngineError::Arithmetic("reserve_in + amount_in_after_fee overflows".into())
+    })?;
 
     mul_div(amount_in_after_fee, reserve_out, denominator)
 }
@@ -165,9 +165,13 @@ mod tests {
         let huge_in = U256::from(1u128) << 100usize;
         let reserve_in = U256::from(1_000_000u64);
         let reserve_out = U256::from(2_000_000u64);
-        let result =
-            quote_exact_input_aerodrome_volatile(huge_in, reserve_in, reserve_out, U256::from(30u64))
-                .unwrap();
+        let result = quote_exact_input_aerodrome_volatile(
+            huge_in,
+            reserve_in,
+            reserve_out,
+            U256::from(30u64),
+        )
+        .unwrap();
         assert!(result < reserve_out);
     }
 
@@ -195,9 +199,13 @@ mod tests {
         let amount_in = U256::from(100_000u64);
         let reserve_in = U256::from(1_000_000u64);
         let reserve_out = U256::from(2_000_000u64);
-        let low_fee =
-            quote_exact_input_aerodrome_volatile(amount_in, reserve_in, reserve_out, U256::from(5u64))
-                .unwrap();
+        let low_fee = quote_exact_input_aerodrome_volatile(
+            amount_in,
+            reserve_in,
+            reserve_out,
+            U256::from(5u64),
+        )
+        .unwrap();
         let high_fee = quote_exact_input_aerodrome_volatile(
             amount_in,
             reserve_in,

@@ -1,4 +1,4 @@
-﻿//! Aerodrome Slipstream (concentrated-liquidity) `CLFactory` discovery.
+//! Aerodrome Slipstream (concentrated-liquidity) `CLFactory` discovery.
 //!
 //! IMPORTANT - PARTIALLY VERIFIED:
 //! The event *emission* is confirmed directly from `CLFactory.sol`'s real
@@ -68,11 +68,8 @@ impl PoolDiscoveryAdapter for AerodromeSlipstreamDiscovery {
             .transaction_hash
             .ok_or_else(|| EngineError::MalformedEvent("log missing transaction_hash".into()))?;
 
-        let decoded_log = PoolCreated::decode_log(&log.inner).map_err(|e| {
-            EngineError::Decode(format!(
-                "failed to decode PoolCreated log: {e}"
-            ))
-        })?;
+        let decoded_log = PoolCreated::decode_log(&log.inner)
+            .map_err(|e| EngineError::Decode(format!("failed to decode PoolCreated log: {e}")))?;
         let decoded = decoded_log.data;
 
         Ok(DiscoveredPool {

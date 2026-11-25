@@ -83,7 +83,10 @@ mod tests {
     fn event_id_is_stable_and_deterministic() {
         let a = sample_id(5);
         let b = sample_id(5);
-        assert_eq!(a, b, "identical (chain_id, tx_hash, log_index) must be equal");
+        assert_eq!(
+            a, b,
+            "identical (chain_id, tx_hash, log_index) must be equal"
+        );
         assert_eq!(a.to_string(), b.to_string());
     }
 }

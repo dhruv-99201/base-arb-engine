@@ -1,4 +1,4 @@
-﻿//! Aerodrome Slipstream (`CLPool`) adapter.
+//! Aerodrome Slipstream (`CLPool`) adapter.
 //!
 //! Concentrated liquidity, structurally close to Uniswap V3 but NOT
 //! ABI-identical - confirmed by reading the real `CLPool` source (verified
@@ -67,10 +67,14 @@ impl DexAdapter for AerodromeSlipstreamAdapter {
         let provider = ProviderBuilder::new().connect_http(url);
         let contract = ICLPool::new(pool.address, provider.clone());
 
-        let slot0 = contract.slot0().call().await.map_err(|e| EngineError::Dex {
-            dex: self.name().into(),
-            reason: format!("slot0() failed: {e}"),
-        })?;
+        let slot0 = contract
+            .slot0()
+            .call()
+            .await
+            .map_err(|e| EngineError::Dex {
+                dex: self.name().into(),
+                reason: format!("slot0() failed: {e}"),
+            })?;
         let liquidity = contract
             .liquidity()
             .call()

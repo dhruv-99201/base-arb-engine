@@ -168,27 +168,19 @@ fn evaluate_one_route(
         }
     };
 
-    let leg1 = match quote_single_candidate(
-        block,
-        route.starting_token(),
-        amount_in,
-        leg1_candidate,
-    ) {
-        Ok(leg_quote) => leg_quote,
-        Err(error) => {
-            return RouteOutcome {
-                route,
-                result: Err(RouteEvaluationFailure::Leg1QuoteFailed { error }),
+    let leg1 =
+        match quote_single_candidate(block, route.starting_token(), amount_in, leg1_candidate) {
+            Ok(leg_quote) => leg_quote,
+            Err(error) => {
+                return RouteOutcome {
+                    route,
+                    result: Err(RouteEvaluationFailure::Leg1QuoteFailed { error }),
+                }
             }
-        }
-    };
+        };
 
-    let leg2 = match quote_single_candidate(
-        block,
-        leg1.token_out,
-        leg1.amount_out,
-        leg2_candidate,
-    ) {
+    let leg2 = match quote_single_candidate(block, leg1.token_out, leg1.amount_out, leg2_candidate)
+    {
         Ok(leg_quote) => leg_quote,
         Err(error) => {
             return RouteOutcome {
@@ -200,11 +192,9 @@ fn evaluate_one_route(
 
     let result = match Opportunity::evaluate(leg1, leg2) {
         Ok(opportunity) => Ok(opportunity),
-        Err(error) => Err(RouteEvaluationFailure::OpportunityEvaluationFailed {
-            leg1,
-            leg2,
-            error,
-        }),
+        Err(error) => {
+            Err(RouteEvaluationFailure::OpportunityEvaluationFailed { leg1, leg2, error })
+        }
     };
 
     RouteOutcome { route, result }
@@ -411,7 +401,10 @@ mod tests {
                 other => panic!("unexpected dex {other:?}"),
             }
         }
-        assert!(saw_aerodrome_first, "expected one route with Aerodrome as leg 1");
+        assert!(
+            saw_aerodrome_first,
+            "expected one route with Aerodrome as leg 1"
+        );
         assert!(saw_v3_first, "expected one route with Uniswap V3 as leg 1");
     }
 
@@ -480,7 +473,10 @@ mod tests {
                 (ok, bad + 1)
             }
         });
-        assert_eq!(ok_count, 2, "the genuinely-fee'd pool's 2 routes must succeed");
+        assert_eq!(
+            ok_count, 2,
+            "the genuinely-fee'd pool's 2 routes must succeed"
+        );
         assert_eq!(failed_count, 2, "the unhydrated pool's 2 routes must fail");
 
         // Every failure must be traceable to the unhydrated-fee pool, not
@@ -630,7 +626,9 @@ mod tests {
 
         let mut saw_aerodrome_first_loss = false;
         for outcome in &outcomes {
-            let opportunity = outcome.opportunity().expect("expected a successful outcome");
+            let opportunity = outcome
+                .opportunity()
+                .expect("expected a successful outcome");
             let expected_profit = I256::try_from(opportunity.final_amount()).unwrap()
                 - I256::try_from(opportunity.input_amount()).unwrap();
             assert_eq!(opportunity.gross_profit(), expected_profit);

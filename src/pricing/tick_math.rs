@@ -1,4 +1,4 @@
-﻿//! Exact Uniswap V3 tick <-> sqrtPriceX96 conversion, ported from the real
+//! Exact Uniswap V3 tick <-> sqrtPriceX96 conversion, ported from the real
 //! `TickMath.sol` source at
 //! `github.com/Uniswap/v3-core/blob/main/contracts/libraries/TickMath.sol`
 //! (every magic constant below was read directly from that source, not
@@ -263,7 +263,17 @@ mod tests {
         // (`sqrtPriceX96 < MAX_SQRT_RATIO`, strictly). There is intentionally
         // no tick "above" MAX_TICK to return, so MAX_SQRT_RATIO itself is
         // not a valid round-trip input - see the dedicated test below.
-        for tick in [MIN_TICK, -887271, -100000, -1, 0, 1, 100000, 887271, MAX_TICK - 1] {
+        for tick in [
+            MIN_TICK,
+            -887271,
+            -100000,
+            -1,
+            0,
+            1,
+            100000,
+            887271,
+            MAX_TICK - 1,
+        ] {
             let sqrt_price = get_sqrt_ratio_at_tick(tick).unwrap();
             let recovered_tick = get_tick_at_sqrt_ratio(sqrt_price).unwrap();
             assert!(

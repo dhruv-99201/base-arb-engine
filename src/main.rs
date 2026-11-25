@@ -9,6 +9,7 @@ mod events;
 mod m10;
 mod m11;
 mod m12;
+mod m13;
 mod m9;
 mod market;
 mod pools;
@@ -50,6 +51,26 @@ async fn main() -> EngineResult<()> {
             Err(msg) => {
                 eprintln!("error: {msg}\n");
                 eprintln!("{}", m12::M12_CATALOG_USAGE);
+                std::process::exit(2)
+            }
+        };
+    }
+
+    // M13: discover a targeted historical pool universe.
+    if raw_args.len() > 1 && raw_args[1] == "discover-pool-universe" {
+        return match m13::parse_m13_pool_universe_args(&raw_args[2..]) {
+            Ok(m13::M13PoolUniverseCommand::Help) => {
+                println!("{}", m13::M13_POOL_UNIVERSE_USAGE);
+                Ok(())
+            }
+            Ok(m13::M13PoolUniverseCommand::Run(args)) => {
+                let config = Config::load()?;
+                telemetry::init_tracing(&config.log_level);
+                m13::run_m13_pool_universe(&config, args).await
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", m13::M13_POOL_UNIVERSE_USAGE);
                 std::process::exit(2)
             }
         };
@@ -163,8 +184,18 @@ async fn main() -> EngineResult<()> {
         }
         return Ok(());
     }
+
     if raw_args.len() > 1 && raw_args[1] == "scan-arb-history" {
-        return match m10::parse_m10_history_args(&raw_args[2..]) {
+        let expanded_args = match m13::expand_m10_catalog_args(&raw_args[2..]) {
+            Ok(args) => args,
+            Err(msg) => {
+                eprintln!("error: {msg}\n");
+                eprintln!("{}", m10::M10_HISTORY_USAGE);
+                std::process::exit(2)
+            }
+        };
+
+        return match m10::parse_m10_history_args(&expanded_args) {
             Ok(m10::M10HistoryCommand::Help) => {
                 println!("{}", m10::M10_HISTORY_USAGE);
                 Ok(())
@@ -181,6 +212,7 @@ async fn main() -> EngineResult<()> {
             }
         };
     }
+
     if raw_args.len() > 1 && raw_args[1] == "scan-arb-sizes" {
         return match m9::parse_m9_size_sweep_args(&raw_args[2..]) {
             Ok(m9::M9SizeSweepCommand::Help) => {

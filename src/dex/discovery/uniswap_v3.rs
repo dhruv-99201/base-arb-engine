@@ -1,4 +1,4 @@
-﻿//! Uniswap V3 factory discovery.
+//! Uniswap V3 factory discovery.
 //!
 //! Event signature is Uniswap's well-known, extensively documented
 //! `UniswapV3Factory.PoolCreated` - the same shape across every chain
@@ -54,9 +54,8 @@ impl PoolDiscoveryAdapter for UniswapV3Discovery {
             .transaction_hash
             .ok_or_else(|| EngineError::MalformedEvent("log missing transaction_hash".into()))?;
 
-        let decoded_log = PoolCreated::decode_log(&log.inner).map_err(|e| {
-            EngineError::Decode(format!("failed to decode PoolCreated log: {e}"))
-        })?;
+        let decoded_log = PoolCreated::decode_log(&log.inner)
+            .map_err(|e| EngineError::Decode(format!("failed to decode PoolCreated log: {e}")))?;
         let decoded = decoded_log.data;
 
         Ok(DiscoveredPool {

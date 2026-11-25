@@ -8,13 +8,17 @@
 //! not model capital, compounding, inventory, transaction ordering, gas, or
 //! execution. It is read-only and never signs or submits transactions.
 
-use crate::arbitrage::{detect_cross_dex_opportunities_at_block, RouteEvaluationFailure};
+use crate::arbitrage::{
+    detect_cross_dex_opportunities_at_block, HistoricalQuoteInput, HistoricalUniswapV3Input,
+    RouteEvaluationFailure, RouteOutcome,
+};
 use crate::cli::{build_scan_candidates, PinnedPoolRead};
 use crate::config::Config;
 use crate::dex::{AerodromeAdapter, UniswapV3Adapter};
 use crate::error::{EngineError, EngineResult};
 use crate::m9::{self, M9SizeSweepArgs, M9SizeSweepCommand};
-use crate::market::models::{DexKind, Pool, PoolKind, Token};
+use crate::market::models::{DexKind, Pool, PoolKind, PoolState, Token};
+use crate::pricing::v3_quote::HydratedTicks;
 use alloy::primitives::{Address, I256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use std::collections::BTreeSet;
@@ -40,6 +44,297 @@ where
     })?
 }
 
+// M14: bounded, pool-specific hydration expansion. Only the typed error
+// emitted when a swap crosses the verified hydrated boundary can trigger it.
+//
+// M14_RETRY_POLICY_HELPERS: classification and retry-budget decisions are
+// small private pure functions, and the per-pool expansion attempt takes its
+// block-pinned reader as a closure, so the policy is unit-testable without
+// RPC access. The production reader still pins every read to `block`.
+const MAX_TICK_COVERAGE_RETRIES_PER_POOL: u8 = 2;
+const MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedQuoteLeg {
+    Leg1,
+    Leg2,
+}
+
+/// Which leg's quote failed and why. Only per-leg quote failures can be a
+/// tick-coverage failure; mapping and opportunity-evaluation failures never
+/// are, whatever error they wrap.
+fn failed_quote_leg(failure: &RouteEvaluationFailure) -> Option<(FailedQuoteLeg, &EngineError)> {
+    match failure {
+        RouteEvaluationFailure::Leg1QuoteFailed { error } => Some((FailedQuoteLeg::Leg1, error)),
+        RouteEvaluationFailure::Leg2QuoteFailed { error, .. } => {
+            Some((FailedQuoteLeg::Leg2, error))
+        }
+        RouteEvaluationFailure::InvalidRouteCandidateMapping { .. }
+        | RouteEvaluationFailure::OpportunityEvaluationFailed { .. } => None,
+    }
+}
+
+/// Retry is allowed only for the typed coverage error on a Uniswap V3 leg.
+/// The error is matched by type, never by message text.
+fn is_tick_coverage_retryable(dex: DexKind, error: &EngineError) -> bool {
+    dex == DexKind::UniswapV3 && matches!(error, EngineError::InsufficientV3TickCoverage { .. })
+}
+
+fn tick_coverage_retry_target(outcome: &RouteOutcome) -> Option<(usize, Address)> {
+    let failure = outcome.failure()?;
+    let (failed_leg, error) = failed_quote_leg(failure)?;
+    let leg = match failed_leg {
+        FailedQuoteLeg::Leg1 => outcome.route().leg1(),
+        FailedQuoteLeg::Leg2 => outcome.route().leg2(),
+    };
+
+    if !is_tick_coverage_retryable(leg.dex(), error) {
+        return None;
+    }
+
+    Some((leg.candidate_index(), leg.pool_address()))
+}
+
+/// The route leg's candidate must still be the Uniswap V3 pool the route
+/// claims before it is eligible for replacement.
+fn candidate_is_retry_target(candidate: &HistoricalQuoteInput, pool_address: Address) -> bool {
+    let pool = &candidate.pool_state().pool;
+    pool.dex == DexKind::UniswapV3 && pool.address == pool_address
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickRetrySkipReason {
+    PerBlockReadLimit,
+    PerPoolRetryLimit,
+    MissingInitialRadius,
+    RadiusOverflow,
+}
+
+impl TickRetrySkipReason {
+    fn report_reason(self) -> String {
+        match self {
+            Self::PerBlockReadLimit => {
+                format!("per_block_retry_read_limit({MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK})")
+            }
+            Self::PerPoolRetryLimit => {
+                format!("per_pool_retry_limit({MAX_TICK_COVERAGE_RETRIES_PER_POOL})")
+            }
+            Self::MissingInitialRadius => "missing_initial_radius".to_string(),
+            Self::RadiusOverflow => "radius_overflow".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickRetryDecision {
+    Expand {
+        current_radius: i32,
+        next_radius: i32,
+    },
+    Skip(TickRetrySkipReason),
+}
+
+/// Pure retry-budget decision. Checks run in a fixed order: per-block read
+/// limit, per-pool retry limit, known initial radius, radius overflow.
+fn decide_tick_retry(
+    block_retry_reads: usize,
+    pool_retry_count: u8,
+    current_radius: Option<i32>,
+) -> TickRetryDecision {
+    if block_retry_reads >= MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK {
+        return TickRetryDecision::Skip(TickRetrySkipReason::PerBlockReadLimit);
+    }
+    if pool_retry_count >= MAX_TICK_COVERAGE_RETRIES_PER_POOL {
+        return TickRetryDecision::Skip(TickRetrySkipReason::PerPoolRetryLimit);
+    }
+    let Some(current_radius) = current_radius else {
+        return TickRetryDecision::Skip(TickRetrySkipReason::MissingInitialRadius);
+    };
+    let Some(next_radius) = current_radius.checked_add(1) else {
+        return TickRetryDecision::Skip(TickRetrySkipReason::RadiusOverflow);
+    };
+    TickRetryDecision::Expand {
+        current_radius,
+        next_radius,
+    }
+}
+
+/// Every attempted read consumes budget up front, so a failed or rejected
+/// expansion still counts against both limits.
+fn consume_tick_retry_budget(block_retry_reads: &mut usize, pool_retry_count: &mut u8) {
+    *block_retry_reads = block_retry_reads.saturating_add(1);
+    *pool_retry_count = pool_retry_count.saturating_add(1);
+}
+
+struct TickCoverageRetryContext<'a> {
+    rpc_url: &'a str,
+    adapter: &'a UniswapV3Adapter,
+    candidate_word_radii: &'a mut [Option<i32>],
+    candidate_retry_counts: &'a mut [u8],
+    block_retry_reads: &'a mut usize,
+    report: &'a mut String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickExpansionStep {
+    Expanded,
+    Skipped,
+    Failed,
+}
+
+/// One bounded expansion attempt for one candidate. `read` receives the next
+/// word radius and must return a state/tick pair read at `block`; it is not
+/// called at all when the budget decision is to skip. The candidate and its
+/// stored radius change only after the read passes historical-input
+/// validation for `block`.
+async fn attempt_tick_expansion<R, Fut>(
+    block: u64,
+    candidate_index: usize,
+    pool_address: Address,
+    candidates: &mut [HistoricalQuoteInput],
+    retry: &mut TickCoverageRetryContext<'_>,
+    read: R,
+) -> TickExpansionStep
+where
+    R: FnOnce(i32) -> Fut,
+    Fut: Future<Output = EngineResult<(PoolState, HydratedTicks)>>,
+{
+    let decision = decide_tick_retry(
+        *retry.block_retry_reads,
+        retry.candidate_retry_counts[candidate_index],
+        retry.candidate_word_radii[candidate_index],
+    );
+    let (current_radius, next_radius) = match decision {
+        TickRetryDecision::Skip(reason) => {
+            retry.report.push_str(&format!(
+                "[tick_retry] block={block} pool={pool_address} status=SKIPPED reason={}\n",
+                reason.report_reason()
+            ));
+            return TickExpansionStep::Skipped;
+        }
+        TickRetryDecision::Expand {
+            current_radius,
+            next_radius,
+        } => (current_radius, next_radius),
+    };
+
+    consume_tick_retry_budget(
+        retry.block_retry_reads,
+        &mut retry.candidate_retry_counts[candidate_index],
+    );
+
+    match read(next_radius).await {
+        Ok((state, ticks)) => {
+            if state.pool.address != pool_address {
+                retry.report.push_str(&format!(
+                    "[tick_retry] block={block} pool={pool_address} status=FAILED reason=returned_pool_address_mismatch actual={}\n",
+                    state.pool.address
+                ));
+                return TickExpansionStep::Failed;
+            }
+            match HistoricalUniswapV3Input::from_pinned_read(block, (state, ticks)) {
+                Ok(input) => {
+                    candidates[candidate_index] = HistoricalQuoteInput::UniswapV3(input);
+                    retry.candidate_word_radii[candidate_index] = Some(next_radius);
+                    retry.report.push_str(&format!(
+                        "[tick_retry] block={block} pool={pool_address} radius={current_radius}->{next_radius} status=EXPANDED reads_used={}\n",
+                        *retry.block_retry_reads
+                    ));
+                    TickExpansionStep::Expanded
+                }
+                Err(error) => {
+                    retry.report.push_str(&format!(
+                        "[tick_retry] block={block} pool={pool_address} radius={next_radius} status=FAILED reason=historical_input_validation error={error}\n"
+                    ));
+                    TickExpansionStep::Failed
+                }
+            }
+        }
+        Err(error) => {
+            retry.report.push_str(&format!(
+                "[tick_retry] block={block} pool={pool_address} radius={next_radius} status=FAILED error={error}\n"
+            ));
+            TickExpansionStep::Failed
+        }
+    }
+}
+
+async fn detect_with_bounded_tick_expansion(
+    block: u64,
+    token_in: Address,
+    amount_in: U256,
+    candidates: &mut [HistoricalQuoteInput],
+    retry: &mut TickCoverageRetryContext<'_>,
+) -> EngineResult<Vec<RouteOutcome>> {
+    let mut blocked_candidates = BTreeSet::new();
+
+    loop {
+        let outcomes =
+            detect_cross_dex_opportunities_at_block(block, token_in, amount_in, candidates)?;
+
+        let mut targets = BTreeSet::new();
+        for outcome in &outcomes {
+            let Some((candidate_index, pool_address)) = tick_coverage_retry_target(outcome) else {
+                continue;
+            };
+            if blocked_candidates.contains(&candidate_index) {
+                continue;
+            }
+            let candidate_matches = candidates
+                .get(candidate_index)
+                .is_some_and(|candidate| candidate_is_retry_target(candidate, pool_address));
+            if candidate_matches {
+                targets.insert((candidate_index, pool_address));
+            }
+        }
+
+        if targets.is_empty() {
+            return Ok(outcomes);
+        }
+
+        let mut expanded_any = false;
+        for (candidate_index, pool_address) in targets {
+            let rpc_url = retry.rpc_url;
+            let adapter = retry.adapter;
+            let step = attempt_tick_expansion(
+                block,
+                candidate_index,
+                pool_address,
+                candidates,
+                retry,
+                |next_radius| async move {
+                    let label = format!(
+                        "M10 V3 tick-coverage expansion for pool {pool_address} at block {block} (radius {next_radius})"
+                    );
+                    let placeholder = scan_placeholder_v3_pool(pool_address);
+                    with_rpc_timeout(
+                        label,
+                        Duration::from_secs(POOL_READ_TIMEOUT_SECS),
+                        adapter.get_pool_state_and_ticks_at_block(
+                            rpc_url,
+                            &placeholder,
+                            next_radius,
+                            Some(block),
+                        ),
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            match step {
+                TickExpansionStep::Expanded => expanded_any = true,
+                TickExpansionStep::Skipped | TickExpansionStep::Failed => {
+                    blocked_candidates.insert(candidate_index);
+                }
+            }
+        }
+
+        if !expanded_any {
+            return Ok(outcomes);
+        }
+    }
+}
 fn flush_csv_buffer(
     file: &mut std::fs::File,
     csv: &mut String,
@@ -61,12 +356,15 @@ fn flush_csv_buffer(
 }
 pub const M10_HISTORY_USAGE: &str = "\
 Usage: cargo run -- scan-arb-history --aerodrome-pool <ADDRESS> [repeat] --uniswap-v3-pool <ADDRESS> [repeat] --block <U64> --block <U64> [more blocks] --token-in <ADDRESS> --size-in <RAW_INTEGER> --size-in <RAW_INTEGER> [more sizes] --csv-out <PATH> [--estimated-cost-raw <RAW_INTEGER>] [--word-radius <I32>]
-
+  --pool-catalog <PATH>       Use an M13 catalog instead of manual pool flags.
 M10 read-only multi-block historical validation. Loads the supplied Aerodrome
 Classic and Uniswap V3 pools independently at EVERY requested block, then
 runs the M9 discrete size sweep against each block's own pinned pool state.
 Pool-load results, route outcomes, losses, and quote failures are written to
 one CSV. No pool state is carried forward from one block to another.
+When --pool-catalog is used, manual --aerodrome-pool and --uniswap-v3-pool
+flags must not be supplied. Only cross-DEX pairs containing --token-in and
+created by the earliest requested block are selected.
 
 Supply 2..=100 distinct --block values and 2..=50 distinct --size-in values.
 Blocks are processed sequentially in the order supplied. All size and cost
@@ -82,7 +380,10 @@ is included.
 This is NOT a stateful trading backtest: it does not model capital, inventory,
 compounding, or execution between blocks. It is a read-only historical sample
 comparison, not a live trading signal. No transaction is signed or submitted.
-V3 tick hydration remains limited by --word-radius at each block.
+V3 tick hydration starts at --word-radius. M10 may perform a bounded number
+of additional, block-pinned reads for an affected Uniswap V3 pool when a swap
+reaches the confirmed hydration boundary; retry limits are enforced per pool
+and per block.
 
 Options:
   --aerodrome-pool <ADDRESS>   Aerodrome Classic volatile pool; repeatable.
@@ -404,7 +705,7 @@ pub async fn run_m10_history(config: &Config, args: M10HistoryArgs) -> EngineRes
             block_index + 1,
             args.blocks.len()
         );
-        report.push_str(&format!("\n[block {}] number={block}\n", block_index + 1));
+
         report.push_str(&format!("\n[block {}] number={block}\n", block_index + 1));
         let mut reads: Vec<(DexKind, Address, EngineResult<PinnedPoolRead>)> =
             Vec::with_capacity(args.scan.aerodrome_pools.len() + args.scan.uniswap_v3_pools.len());
@@ -454,7 +755,19 @@ pub async fn run_m10_history(config: &Config, args: M10HistoryArgs) -> EngineRes
             reads.push((DexKind::UniswapV3, *address, read));
         }
 
-        let (loads, candidates) = build_scan_candidates(block, reads);
+        let (loads, mut candidates) = build_scan_candidates(block, reads);
+        let mut candidate_word_radii = candidates
+            .iter()
+            .map(|candidate| {
+                if candidate.pool_state().pool.dex == DexKind::UniswapV3 {
+                    Some(args.scan.word_radius)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut candidate_retry_counts = vec![0u8; candidates.len()];
+        let mut tick_coverage_retry_reads = 0usize;
         let requested = loads.len();
         let loaded = loads.iter().filter(|load| load.result.is_ok()).count();
         let failed = requested - loaded;
@@ -523,12 +836,22 @@ pub async fn run_m10_history(config: &Config, args: M10HistoryArgs) -> EngineRes
                 size_index + 1,
                 size
             ));
-            let outcomes = match detect_cross_dex_opportunities_at_block(
+            let outcomes = match detect_with_bounded_tick_expansion(
                 block,
                 args.scan.token_in,
                 *size,
-                &candidates,
-            ) {
+                &mut candidates,
+                &mut TickCoverageRetryContext {
+                    rpc_url: &config.base_rpc_url,
+                    adapter: &uniswap_v3_adapter,
+                    candidate_word_radii: &mut candidate_word_radii,
+                    candidate_retry_counts: &mut candidate_retry_counts,
+                    block_retry_reads: &mut tick_coverage_retry_reads,
+                    report: &mut report,
+                },
+            )
+            .await
+            {
                 Ok(outcomes) => outcomes,
                 Err(error) => {
                     detector_failed = true;
@@ -735,6 +1058,10 @@ pub async fn run_m10_history(config: &Config, args: M10HistoryArgs) -> EngineRes
                 outcomes.len()
             );
         }
+        report.push_str(&format!(
+            "[block {block}] tick_coverage_retry_reads={}\n",
+            tick_coverage_retry_reads
+        ));
         println!(
             "[progress] block {}/{} complete: {block}",
             block_index + 1,
@@ -941,5 +1268,517 @@ mod tests {
         append_csv_row(&mut csv, &row);
         assert!(csv.contains("\"RPC error, reason: \"\"historical state unavailable\"\"\""));
         assert_eq!(row.len(), 19);
+    }
+}
+
+// M14_RETRY_POLICY_TESTS: deterministic regression tests for the bounded
+// tick-coverage retry policy. No RPC: expansion reads are injected closures.
+#[cfg(test)]
+mod m14_retry_policy_tests {
+    use super::*;
+    use crate::arbitrage::opportunity::LegQuote;
+    use crate::arbitrage::HistoricalAerodromeInput;
+    use alloy::primitives::address;
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+
+    const BLOCK: u64 = 26_000_000;
+    const POOL: Address = address!("d0b53D9277642d899DF5C87A3966A349A798F224");
+    const OTHER_POOL: Address = address!("0000000000000000000000000000000000000b02");
+    const WETH: Address = address!("4200000000000000000000000000000000000006");
+    const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    const INITIAL_HI: i32 = -192_010;
+    const EXPANDED_HI: i32 = -184_330;
+
+    fn coverage_error() -> EngineError {
+        EngineError::InsufficientV3TickCoverage {
+            required_tick: -190_000,
+            hydrated_tick_lo: -199_680,
+            hydrated_tick_hi: INITIAL_HI,
+        }
+    }
+
+    fn v3_state(address: Address, block: u64, dex: DexKind) -> PoolState {
+        let kind = if dex == DexKind::Aerodrome {
+            PoolKind::Aerodrome {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(2_000_000u64),
+                stable: false,
+                fee_bps: Some(U256::from(30u64)),
+            }
+        } else {
+            PoolKind::ConcentratedLiquidity {
+                fee_tier: 500,
+                tick_spacing: 10,
+                sqrt_price_x96: U256::from_str_radix("4166855781027983759429743", 10).unwrap(),
+                current_tick: -197_069,
+                liquidity: 2_241_227_707_498_366_949u128,
+                initialized_ticks: Default::default(),
+            }
+        };
+        let token = |address, symbol: &str| Token {
+            address,
+            symbol: symbol.into(),
+            decimals: 0,
+        };
+        PoolState::new(
+            Pool {
+                address,
+                dex,
+                token0: token(WETH, "T0"),
+                token1: token(USDC, "T1"),
+                kind,
+            },
+            block,
+            None,
+        )
+    }
+
+    fn hydrated(hi: i32) -> HydratedTicks {
+        let mut ticks = BTreeMap::new();
+        ticks.insert(-197_070, -1_776_514_264_016_992i128);
+        HydratedTicks::for_test(ticks, -199_680, hi)
+    }
+
+    fn v3_candidate(address: Address) -> HistoricalQuoteInput {
+        HistoricalQuoteInput::UniswapV3(
+            HistoricalUniswapV3Input::new(
+                BLOCK,
+                v3_state(address, BLOCK, DexKind::UniswapV3),
+                hydrated(INITIAL_HI),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn candidate_hi(candidate: &HistoricalQuoteInput) -> i32 {
+        match candidate {
+            HistoricalQuoteInput::UniswapV3(input) => input.hydrated().hydrated_tick_hi(),
+            other => panic!("expected a Uniswap V3 candidate, got {other:?}"),
+        }
+    }
+
+    /// Owns the mutable retry state so each test can drive one candidate.
+    struct Harness {
+        candidates: Vec<HistoricalQuoteInput>,
+        radii: Vec<Option<i32>>,
+        counts: Vec<u8>,
+        block_reads: usize,
+        report: String,
+        adapter: UniswapV3Adapter,
+    }
+
+    impl Harness {
+        fn new(radius: Option<i32>) -> Self {
+            Self {
+                candidates: vec![v3_candidate(POOL)],
+                radii: vec![radius],
+                counts: vec![0],
+                block_reads: 0,
+                report: String::new(),
+                adapter: UniswapV3Adapter::new(),
+            }
+        }
+
+        /// One attempt on candidate 0 with an injected reader. Returns the
+        /// step result, how many times the reader ran, and the radius asked.
+        async fn attempt(
+            &mut self,
+            result: EngineResult<(PoolState, HydratedTicks)>,
+        ) -> (TickExpansionStep, usize, Option<i32>) {
+            let calls = Cell::new(0usize);
+            let requested = Cell::new(None);
+            let mut ctx = TickCoverageRetryContext {
+                rpc_url: "unused-no-rpc-in-tests",
+                adapter: &self.adapter,
+                candidate_word_radii: &mut self.radii,
+                candidate_retry_counts: &mut self.counts,
+                block_retry_reads: &mut self.block_reads,
+                report: &mut self.report,
+            };
+            let step =
+                attempt_tick_expansion(BLOCK, 0, POOL, &mut self.candidates, &mut ctx, |radius| {
+                    calls.set(calls.get() + 1);
+                    requested.set(Some(radius));
+                    std::future::ready(result)
+                })
+                .await;
+            (step, calls.get(), requested.get())
+        }
+    }
+
+    fn rpc_failure() -> EngineResult<(PoolState, HydratedTicks)> {
+        Err(EngineError::Chain("simulated archive rpc failure".into()))
+    }
+
+    fn valid_expansion() -> EngineResult<(PoolState, HydratedTicks)> {
+        Ok((
+            v3_state(POOL, BLOCK, DexKind::UniswapV3),
+            hydrated(EXPANDED_HI),
+        ))
+    }
+
+    // ---- limits are exactly as specified ----
+
+    #[test]
+    fn retry_limits_are_unchanged() {
+        assert_eq!(MAX_TICK_COVERAGE_RETRIES_PER_POOL, 2);
+        assert_eq!(MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK, 8);
+    }
+
+    // ---- classification ----
+
+    #[test]
+    fn only_the_typed_tick_coverage_error_on_a_v3_leg_is_retryable() {
+        assert!(is_tick_coverage_retryable(
+            DexKind::UniswapV3,
+            &coverage_error()
+        ));
+    }
+
+    #[test]
+    fn other_error_types_are_not_retryable() {
+        let others = [
+            EngineError::Arithmetic("overflow".into()),
+            EngineError::State("stale".into()),
+            EngineError::Chain("rpc down".into()),
+            EngineError::NotImplemented("stable pool".into()),
+            EngineError::Dex {
+                dex: "uniswap_v3".into(),
+                reason: "slot0() failed".into(),
+            },
+            // Message text must never be matched; only the typed variant.
+            EngineError::Dex {
+                dex: "uniswap_v3".into(),
+                reason: "insufficient Uniswap V3 tick coverage".into(),
+            },
+            EngineError::State("InsufficientV3TickCoverage".into()),
+        ];
+        for error in &others {
+            assert!(
+                !is_tick_coverage_retryable(DexKind::UniswapV3, error),
+                "must not retry {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_uniswap_v3_legs_are_never_retryable() {
+        for dex in [DexKind::Aerodrome, DexKind::AerodromeSlipstream] {
+            assert!(
+                !is_tick_coverage_retryable(dex, &coverage_error()),
+                "{dex:?} must not be retried even with the typed error"
+            );
+        }
+    }
+
+    #[test]
+    fn only_per_leg_quote_failures_can_name_a_failed_leg() {
+        let leg = LegQuote {
+            dex: DexKind::UniswapV3,
+            pool_address: POOL,
+            token_in: WETH,
+            token_out: USDC,
+            amount_in: U256::from(1u64),
+            amount_out: U256::from(1u64),
+            block: BLOCK,
+        };
+
+        let leg1 = RouteEvaluationFailure::Leg1QuoteFailed {
+            error: coverage_error(),
+        };
+        let (which, error) = failed_quote_leg(&leg1).unwrap();
+        assert_eq!(which, FailedQuoteLeg::Leg1);
+        assert!(matches!(
+            error,
+            EngineError::InsufficientV3TickCoverage { .. }
+        ));
+
+        let leg2 = RouteEvaluationFailure::Leg2QuoteFailed {
+            leg1: leg,
+            error: coverage_error(),
+        };
+        assert_eq!(failed_quote_leg(&leg2).unwrap().0, FailedQuoteLeg::Leg2);
+
+        // The same typed error wrapped in a non-quote failure is not retryable.
+        let mapping = RouteEvaluationFailure::InvalidRouteCandidateMapping {
+            error: coverage_error(),
+        };
+        assert!(failed_quote_leg(&mapping).is_none());
+        let opportunity = RouteEvaluationFailure::OpportunityEvaluationFailed {
+            leg1: leg,
+            leg2: leg,
+            error: coverage_error(),
+        };
+        assert!(failed_quote_leg(&opportunity).is_none());
+    }
+
+    #[test]
+    fn candidate_must_still_be_the_claimed_uniswap_v3_pool() {
+        let v3 = v3_candidate(POOL);
+        assert!(candidate_is_retry_target(&v3, POOL));
+        assert!(!candidate_is_retry_target(&v3, OTHER_POOL));
+
+        let aerodrome = HistoricalQuoteInput::Aerodrome(
+            HistoricalAerodromeInput::new(BLOCK, v3_state(POOL, BLOCK, DexKind::Aerodrome))
+                .unwrap(),
+        );
+        assert!(!candidate_is_retry_target(&aerodrome, POOL));
+    }
+
+    // ---- pure budget decisions ----
+
+    #[test]
+    fn per_pool_limit_allows_two_attempts_then_skips() {
+        for used in 0..MAX_TICK_COVERAGE_RETRIES_PER_POOL {
+            assert_eq!(
+                decide_tick_retry(0, used, Some(1)),
+                TickRetryDecision::Expand {
+                    current_radius: 1,
+                    next_radius: 2
+                },
+                "attempt {} must be allowed",
+                used + 1
+            );
+        }
+        assert_eq!(
+            decide_tick_retry(0, 2, Some(1)),
+            TickRetryDecision::Skip(TickRetrySkipReason::PerPoolRetryLimit)
+        );
+        assert_eq!(
+            decide_tick_retry(0, u8::MAX, Some(1)),
+            TickRetryDecision::Skip(TickRetrySkipReason::PerPoolRetryLimit)
+        );
+    }
+
+    #[test]
+    fn per_block_limit_allows_eight_reads_then_skips() {
+        for used in 0..MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK {
+            assert!(
+                matches!(
+                    decide_tick_retry(used, 0, Some(1)),
+                    TickRetryDecision::Expand { .. }
+                ),
+                "read {} must be allowed",
+                used + 1
+            );
+        }
+        for used in [8usize, 9, usize::MAX] {
+            assert_eq!(
+                decide_tick_retry(used, 0, Some(1)),
+                TickRetryDecision::Skip(TickRetrySkipReason::PerBlockReadLimit)
+            );
+        }
+    }
+
+    #[test]
+    fn per_block_limit_is_reported_before_per_pool_limit() {
+        assert_eq!(
+            decide_tick_retry(8, 2, Some(1)),
+            TickRetryDecision::Skip(TickRetrySkipReason::PerBlockReadLimit)
+        );
+    }
+
+    #[test]
+    fn missing_initial_radius_is_skipped_safely() {
+        assert_eq!(
+            decide_tick_retry(0, 0, None),
+            TickRetryDecision::Skip(TickRetrySkipReason::MissingInitialRadius)
+        );
+        // Limits still win over a missing radius.
+        assert_eq!(
+            decide_tick_retry(0, 2, None),
+            TickRetryDecision::Skip(TickRetrySkipReason::PerPoolRetryLimit)
+        );
+    }
+
+    #[test]
+    fn radius_overflow_is_skipped_safely_without_wrapping() {
+        assert_eq!(
+            decide_tick_retry(0, 0, Some(i32::MAX)),
+            TickRetryDecision::Skip(TickRetrySkipReason::RadiusOverflow)
+        );
+        assert_eq!(
+            decide_tick_retry(0, 0, Some(i32::MAX - 1)),
+            TickRetryDecision::Expand {
+                current_radius: i32::MAX - 1,
+                next_radius: i32::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn skip_reasons_render_the_exact_report_strings() {
+        assert_eq!(
+            TickRetrySkipReason::PerBlockReadLimit.report_reason(),
+            "per_block_retry_read_limit(8)"
+        );
+        assert_eq!(
+            TickRetrySkipReason::PerPoolRetryLimit.report_reason(),
+            "per_pool_retry_limit(2)"
+        );
+        assert_eq!(
+            TickRetrySkipReason::MissingInitialRadius.report_reason(),
+            "missing_initial_radius"
+        );
+        assert_eq!(
+            TickRetrySkipReason::RadiusOverflow.report_reason(),
+            "radius_overflow"
+        );
+    }
+
+    #[test]
+    fn consuming_budget_increments_both_counters_and_saturates() {
+        let (mut block_reads, mut pool_count) = (0usize, 0u8);
+        consume_tick_retry_budget(&mut block_reads, &mut pool_count);
+        assert_eq!((block_reads, pool_count), (1, 1));
+
+        let (mut block_reads, mut pool_count) = (usize::MAX, u8::MAX);
+        consume_tick_retry_budget(&mut block_reads, &mut pool_count);
+        assert_eq!((block_reads, pool_count), (usize::MAX, u8::MAX));
+    }
+
+    // ---- the real attempt step, with an injected reader ----
+
+    #[tokio::test]
+    async fn failed_rpc_attempts_consume_budget_until_the_pool_limit() {
+        let mut h = Harness::new(Some(1));
+
+        let (step, calls, requested) = h.attempt(rpc_failure()).await;
+        assert_eq!(step, TickExpansionStep::Failed);
+        assert_eq!((calls, requested), (1, Some(2)));
+        assert_eq!((h.block_reads, h.counts[0]), (1, 1));
+        assert_eq!(h.radii[0], Some(1), "a failed read must not change radius");
+        assert_eq!(candidate_hi(&h.candidates[0]), INITIAL_HI);
+
+        let (step, calls, requested) = h.attempt(rpc_failure()).await;
+        assert_eq!(step, TickExpansionStep::Failed);
+        assert_eq!((calls, requested), (1, Some(2)), "radius is not advanced");
+        assert_eq!((h.block_reads, h.counts[0]), (2, 2));
+
+        // Third attempt: budget exhausted, so the reader must not run.
+        let (step, calls, _) = h.attempt(valid_expansion()).await;
+        assert_eq!(step, TickExpansionStep::Skipped);
+        assert_eq!(calls, 0);
+        assert_eq!((h.block_reads, h.counts[0]), (2, 2));
+        assert_eq!(candidate_hi(&h.candidates[0]), INITIAL_HI);
+        assert!(h.report.contains("status=FAILED error="));
+        assert!(h
+            .report
+            .contains("status=SKIPPED reason=per_pool_retry_limit(2)"));
+    }
+
+    #[tokio::test]
+    async fn per_block_limit_stops_reads_across_pools() {
+        let mut h = Harness::new(Some(1));
+        h.block_reads = MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK - 1;
+
+        let (step, calls, _) = h.attempt(rpc_failure()).await;
+        assert_eq!((step, calls), (TickExpansionStep::Failed, 1));
+        assert_eq!(h.block_reads, MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK);
+
+        // A fresh pool on the same block is still blocked by the block limit.
+        h.counts[0] = 0;
+        let (step, calls, _) = h.attempt(valid_expansion()).await;
+        assert_eq!((step, calls), (TickExpansionStep::Skipped, 0));
+        assert_eq!(h.block_reads, MAX_TICK_COVERAGE_RETRY_READS_PER_BLOCK);
+        assert_eq!(h.counts[0], 0, "a skipped attempt consumes nothing");
+        assert!(h
+            .report
+            .contains("status=SKIPPED reason=per_block_retry_read_limit(8)"));
+    }
+
+    #[tokio::test]
+    async fn missing_or_overflowing_radius_skips_without_reading_or_consuming() {
+        for (radius, reason) in [
+            (None, "missing_initial_radius"),
+            (Some(i32::MAX), "radius_overflow"),
+        ] {
+            let mut h = Harness::new(radius);
+            let (step, calls, _) = h.attempt(valid_expansion()).await;
+            assert_eq!((step, calls), (TickExpansionStep::Skipped, 0));
+            assert_eq!((h.block_reads, h.counts[0]), (0, 0));
+            assert_eq!(h.radii[0], radius);
+            assert_eq!(candidate_hi(&h.candidates[0]), INITIAL_HI);
+            assert!(h.report.contains(&format!("reason={reason}")), "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn radius_and_candidate_update_only_after_successful_validation() {
+        let mut h = Harness::new(Some(1));
+        let (step, calls, requested) = h.attempt(valid_expansion()).await;
+        assert_eq!(step, TickExpansionStep::Expanded);
+        assert_eq!((calls, requested), (1, Some(2)));
+        assert_eq!(h.radii[0], Some(2));
+        assert_eq!(candidate_hi(&h.candidates[0]), EXPANDED_HI);
+        assert_eq!((h.block_reads, h.counts[0]), (1, 1));
+        assert!(h
+            .report
+            .contains("radius=1->2 status=EXPANDED reads_used=1"));
+    }
+
+    #[tokio::test]
+    async fn state_from_a_different_block_is_rejected_and_changes_nothing() {
+        let mut h = Harness::new(Some(1));
+        let wrong_block = Ok((
+            v3_state(POOL, BLOCK + 1, DexKind::UniswapV3),
+            hydrated(EXPANDED_HI),
+        ));
+        let (step, calls, _) = h.attempt(wrong_block).await;
+        assert_eq!((step, calls), (TickExpansionStep::Failed, 1));
+        assert_eq!(h.radii[0], Some(1), "radius must not move on rejection");
+        assert_eq!(candidate_hi(&h.candidates[0]), INITIAL_HI);
+        assert_eq!(
+            (h.block_reads, h.counts[0]),
+            (1, 1),
+            "a rejected expansion still consumes budget"
+        );
+        assert!(h.report.contains("reason=historical_input_validation"));
+    }
+
+    #[tokio::test]
+    async fn state_that_fails_validation_for_any_reason_changes_nothing() {
+        // Wrong DEX kind for a Uniswap V3 candidate.
+        let mut h = Harness::new(Some(1));
+        let aerodrome_state = Ok((
+            v3_state(POOL, BLOCK, DexKind::Aerodrome),
+            hydrated(EXPANDED_HI),
+        ));
+        let (step, _, _) = h.attempt(aerodrome_state).await;
+        assert_eq!(step, TickExpansionStep::Failed);
+        assert_eq!(h.radii[0], Some(1));
+        assert_eq!(candidate_hi(&h.candidates[0]), INITIAL_HI);
+        assert_eq!((h.block_reads, h.counts[0]), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn returned_pool_address_mismatch_changes_nothing() {
+        let mut h = Harness::new(Some(1));
+        let other = Ok((
+            v3_state(OTHER_POOL, BLOCK, DexKind::UniswapV3),
+            hydrated(EXPANDED_HI),
+        ));
+        let (step, _, _) = h.attempt(other).await;
+        assert_eq!(step, TickExpansionStep::Failed);
+        assert_eq!(h.radii[0], Some(1));
+        assert_eq!(candidate_hi(&h.candidates[0]), INITIAL_HI);
+        assert_eq!((h.block_reads, h.counts[0]), (1, 1));
+        assert!(h.report.contains("reason=returned_pool_address_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn successful_expansions_still_stop_at_the_per_pool_limit() {
+        let mut h = Harness::new(Some(1));
+        for expected_radius in [2, 3] {
+            let (step, _, requested) = h.attempt(valid_expansion()).await;
+            assert_eq!(step, TickExpansionStep::Expanded);
+            assert_eq!(requested, Some(expected_radius));
+            assert_eq!(h.radii[0], Some(expected_radius));
+        }
+        let (step, calls, _) = h.attempt(valid_expansion()).await;
+        assert_eq!((step, calls), (TickExpansionStep::Skipped, 0));
+        assert_eq!(h.radii[0], Some(3));
+        assert_eq!((h.block_reads, h.counts[0]), (2, 2));
     }
 }

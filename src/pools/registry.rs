@@ -1,4 +1,4 @@
-﻿//! In-memory pool registry.
+//! In-memory pool registry.
 //!
 //! Handles pool discovery/lifecycle/lookup. Does NOT handle market state
 //! (that's `market::MarketState`) - keeping these separate means the
@@ -211,7 +211,10 @@ mod tests {
         );
 
         assert!(registry.set_status(&pool_addr, PoolStatus::Hydrating));
-        assert_eq!(registry.get(&pool_addr).unwrap().status, PoolStatus::Hydrating);
+        assert_eq!(
+            registry.get(&pool_addr).unwrap().status,
+            PoolStatus::Hydrating
+        );
 
         assert!(registry.set_status(&pool_addr, PoolStatus::Active));
         assert_eq!(registry.get(&pool_addr).unwrap().status, PoolStatus::Active);

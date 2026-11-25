@@ -1,4 +1,4 @@
-﻿//! Aerodrome classic (Solidly-style) factory discovery.
+//! Aerodrome classic (Solidly-style) factory discovery.
 //!
 //! Event signature confirmed directly against the verified `PoolFactory`
 //! source on BaseScan (address 0x420DD381b31aEf6683db6B902084cB0FFECe40Da,
@@ -57,11 +57,8 @@ impl PoolDiscoveryAdapter for AerodromeClassicDiscovery {
             .transaction_hash
             .ok_or_else(|| EngineError::MalformedEvent("log missing transaction_hash".into()))?;
 
-        let decoded_log = PoolCreated::decode_log(&log.inner).map_err(|e| {
-            EngineError::Decode(format!(
-                "failed to decode PoolCreated log: {e}"
-            ))
-        })?;
+        let decoded_log = PoolCreated::decode_log(&log.inner)
+            .map_err(|e| EngineError::Decode(format!("failed to decode PoolCreated log: {e}")))?;
         let decoded = decoded_log.data;
 
         Ok(DiscoveredPool {
